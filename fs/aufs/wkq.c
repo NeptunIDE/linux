@@ -116,8 +116,10 @@ static void au_wkq_run(struct au_wkinfo *wkinfo)
 	struct workqueue_struct *wkq;
 
 	if (au_ftest_wkq(wkinfo->flags, NEST)) {
-		if (au_wkq_test())
+		if (au_wkq_test()) {
+			AuWarn1("wkq from wkq, due to a dead dir by UDBA?\n");
 			AuDebugOn(au_ftest_wkq(wkinfo->flags, WAIT));
+		}
 	} else
 		au_dbg_verify_kthread();
 	INIT_WORK(&wkinfo->wk, wkq_func);
@@ -162,7 +164,8 @@ int au_wkq_do_wait(unsigned int flags, au_wkq_func_t func, void *args)
  * Note: dget/dput() in func for aufs dentries are not supported. It will be a
  * problem in a concurrent umounting.
  */
-int au_wkq_nowait(au_wkq_func_t func, void *args, struct super_block *sb)
+int au_wkq_nowait(au_wkq_func_t func, void *args, struct super_block *sb,
+		  unsigned int flags)
 {
 	int err;
 	struct au_wkinfo *wkinfo;
@@ -177,7 +180,7 @@ int au_wkq_nowait(au_wkq_func_t func, void *args, struct super_block *sb)
 	wkinfo = kmalloc(sizeof(*wkinfo), GFP_NOFS);
 	if (wkinfo) {
 		wkinfo->kobj = &au_sbi(sb)->si_kobj;
-		wkinfo->flags = !AuWkq_WAIT;
+		wkinfo->flags = flags & ~AuWkq_WAIT;
 		wkinfo->func = func;
 		wkinfo->args = args;
 		wkinfo->comp = NULL;

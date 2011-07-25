@@ -62,7 +62,8 @@ typedef void (*au_wkq_func_t)(void *args);
 
 /* wkq.c */
 int au_wkq_do_wait(unsigned int flags, au_wkq_func_t func, void *args);
-int au_wkq_nowait(au_wkq_func_t func, void *args, struct super_block *sb);
+int au_wkq_nowait(au_wkq_func_t func, void *args, struct super_block *sb,
+		  unsigned int flags);
 void au_nwt_init(struct au_nowait_tasks *nwt);
 int __init au_wkq_init(void);
 void au_wkq_fin(void);
