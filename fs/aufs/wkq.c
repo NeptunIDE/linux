@@ -115,7 +115,11 @@ static void au_wkq_run(struct au_wkinfo *wkinfo)
 {
 	struct workqueue_struct *wkq;
 
-	au_dbg_verify_kthread();
+	if (au_ftest_wkq(wkinfo->flags, NEST)) {
+		if (au_wkq_test())
+			AuDebugOn(au_ftest_wkq(wkinfo->flags, WAIT));
+	} else
+		au_dbg_verify_kthread();
 	INIT_WORK(&wkinfo->wk, wkq_func);
 	if (au_ftest_wkq(wkinfo->flags, WAIT)) {
 		wkq = au_wkq[AuWkq_INORMAL].wkq;
