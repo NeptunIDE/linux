@@ -47,4 +47,6 @@ static inline bool trigger_all_cpu_backtrace(void)
 }
 #endif
 
+extern void nmi_show_regs(struct pt_regs *regs, int in_nmi);
+extern int do_nmi_show_regs(struct pt_regs *regs, int cpu);
 #endif

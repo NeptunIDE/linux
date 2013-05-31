@@ -91,6 +91,7 @@ struct nfs_client {
 #ifdef CONFIG_NFS_FSCACHE
 	struct fscache_cookie	*fscache;	/* client index cache cookie */
 #endif
+	struct ve_struct	*owner_env;
 };
 
 /*
@@ -176,6 +177,7 @@ struct nfs_server {
 #define NFS_CAP_ATIME		(1U << 11)
 #define NFS_CAP_CTIME		(1U << 12)
 #define NFS_CAP_MTIME		(1U << 13)
+#define NFS_CAP_POSIX_LOCK	(1U << 14)
 
 
 /* maximum number of slots to use */

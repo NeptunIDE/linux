@@ -85,6 +85,7 @@
 #include <linux/kmod.h>
 #include <linux/audit.h>
 #include <linux/wireless.h>
+#include <linux/in.h>
 #include <linux/nsproxy.h>
 #include <linux/magic.h>
 
@@ -162,15 +163,6 @@ static DEFINE_PER_CPU(int, sockets_in_use) = 0;
  * divide and look after the messy bits.
  */
 
-#define MAX_SOCK_ADDR	128		/* 108 for Unix domain -
-					   16 for IP, 16 for IPX,
-					   24 for IPv6,
-					   about 80 for AX.25
-					   must be at least one bigger than
-					   the AF_UNIX size (see net/unix/af_unix.c
-					   :unix_mkname()).
-					 */
-
 /**
  *	move_addr_to_kernel	-	copy a socket address into kernel space
  *	@uaddr: Address in user space
@@ -192,6 +184,7 @@ int move_addr_to_kernel(void __user *uaddr, int ulen, struct sockaddr *kaddr)
 		return -EFAULT;
 	return audit_sockaddr(ulen, kaddr);
 }
+EXPORT_SYMBOL(move_addr_to_kernel);
 
 /**
  *	move_addr_to_user	-	copy an address to user space
@@ -497,6 +490,8 @@ static struct socket *sock_alloc(void)
 	return sock;
 }
 
+EXPORT_SYMBOL(sock_alloc);
+
 /*
  *	In theory you can't get an open on this inode, but /proc provides
  *	a back door. Remember to keep it shut otherwise you'll let the
@@ -524,6 +519,9 @@ const struct file_operations bad_sock_fops = {
 
 void sock_release(struct socket *sock)
 {
+	if (sock->sk)
+		ub_sock_sndqueuedel(sock->sk);
+
 	if (sock->ops) {
 		struct module *owner = sock->ops->owner;
 
@@ -1140,6 +1138,54 @@ call_kill:
 	return 0;
 }
 
+int vz_security_family_check(int family)
+{
+#ifdef CONFIG_VE
+	if (ve_is_super(get_exec_env()))
+		return 0;
+
+	switch (family) {
+	case PF_UNSPEC:
+	case PF_PACKET:
+	case PF_NETLINK:
+	case PF_UNIX:
+	case PF_INET:
+	case PF_INET6:
+	case PF_PPPOX:
+	case PF_KEY:
+		break;
+	default:
+		return -EAFNOSUPPORT;
+        }
+#endif
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vz_security_family_check);
+
+int vz_security_protocol_check(int protocol)
+{
+#ifdef CONFIG_VE
+	if (ve_is_super(get_exec_env()))
+		return 0;
+
+	switch (protocol) {
+	case  IPPROTO_IP:
+	case  IPPROTO_TCP:
+	case  IPPROTO_UDP:
+	case  IPPROTO_RAW:
+	case  IPPROTO_DCCP:
+	case  IPPROTO_GRE:
+	case  IPPROTO_ESP:
+	case  IPPROTO_AH:
+		break;
+	default:
+		return -EAFNOSUPPORT;
+	}
+#endif
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vz_security_protocol_check);
+
 static int __sock_create(struct net *net, int family, int type, int protocol,
 			 struct socket **res, int kern)
 {
@@ -1169,6 +1215,11 @@ static int __sock_create(struct net *net, int family, int type, int protocol,
 		}
 		family = PF_PACKET;
 	}
+
+	/* VZ compatibility layer */
+	err = vz_security_family_check(family);
+	if (err < 0)
+		return err;
 
 	err = security_socket_create(family, type, protocol, kern);
 	if (err)
@@ -1673,6 +1724,8 @@ SYSCALL_DEFINE6(sendto, int, fd, void __user *, buff, size_t, len,
 	struct iovec iov;
 	int fput_needed;
 
+	if (len > INT_MAX)
+		len = INT_MAX;
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (!sock)
 		goto out;
@@ -1730,6 +1783,8 @@ SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
 	int err, err2;
 	int fput_needed;
 
+	if (size > INT_MAX)
+		size = INT_MAX;
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (!sock)
 		goto out;
@@ -2419,9 +2474,12 @@ int kernel_sock_ioctl(struct socket *sock, int cmd, unsigned long arg)
 {
 	mm_segment_t oldfs = get_fs();
 	int err;
+	struct ve_struct *old_env;
 
 	set_fs(KERNEL_DS);
+	old_env = set_exec_env(sock->sk->owner_env);
 	err = sock->ops->ioctl(sock, cmd, arg);
+	(void)set_exec_env(old_env);
 	set_fs(oldfs);
 
 	return err;

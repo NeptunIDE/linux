@@ -2,6 +2,7 @@
 #include <linux/init.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/sched.h>
 
 static int devinfo_show(struct seq_file *f, void *v)
 {
@@ -25,6 +26,9 @@ static int devinfo_show(struct seq_file *f, void *v)
 
 static void *devinfo_start(struct seq_file *f, loff_t *pos)
 {
+	if (!ve_is_super(get_exec_env()))
+		return NULL;
+
 	if (*pos < (BLKDEV_MAJOR_HASH_SIZE + CHRDEV_MAJOR_HASH_SIZE))
 		return pos;
 	return NULL;
@@ -64,7 +68,7 @@ static const struct file_operations proc_devinfo_operations = {
 
 static int __init proc_devices_init(void)
 {
-	proc_create("devices", 0, NULL, &proc_devinfo_operations);
+	proc_create("devices", 0, &glob_proc_root, &proc_devinfo_operations);
 	return 0;
 }
 module_init(proc_devices_init);

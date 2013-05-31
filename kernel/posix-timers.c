@@ -31,6 +31,8 @@
  * POSIX clocks & timers
  */
 #include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/smp_lock.h>
 #include <linux/interrupt.h>
 #include <linux/slab.h>
 #include <linux/time.h>
@@ -46,6 +48,9 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/module.h>
+#include <linux/pid_namespace.h>
+
+#include <bc/beancounter.h>
 
 /*
  * Management arrays for POSIX timers.	 Timers are kept in slab memory
@@ -303,8 +308,8 @@ static __init int init_posix_timers(void)
 	register_posix_clock(CLOCK_MONOTONIC_COARSE, &clock_monotonic_coarse);
 
 	posix_timers_cache = kmem_cache_create("posix_timers_cache",
-					sizeof (struct k_itimer), 0, SLAB_PANIC,
-					NULL);
+					sizeof (struct k_itimer), 0,
+					SLAB_PANIC|SLAB_UBC, NULL);
 	idr_init(&posix_timers_id);
 	return 0;
 }
@@ -363,6 +368,7 @@ int posix_timer_event(struct k_itimer *timr, int si_private)
 {
 	struct task_struct *task;
 	int shared, ret = -1;
+
 	/*
 	 * FIXME: if ->sigq is queued we can race with
 	 * dequeue_signal()->do_schedule_next_timer().
@@ -379,8 +385,17 @@ int posix_timer_event(struct k_itimer *timr, int si_private)
 	rcu_read_lock();
 	task = pid_task(timr->it_pid, PIDTYPE_PID);
 	if (task) {
+		struct ve_struct *ve;
+		struct user_beancounter *ub;
+
+		ve = set_exec_env(task->ve_task_info.owner_env);
+		ub = set_exec_ub(task->task_bc.task_ub);
+
 		shared = !(timr->it_sigev_notify & SIGEV_THREAD_ID);
 		ret = send_sigqueue(timr->sigq, task, shared);
+
+		(void)set_exec_ub(ub);
+		(void)set_exec_env(ve);
 	}
 	rcu_read_unlock();
 	/* If we failed to send the signal the timer stops. */
@@ -559,14 +574,7 @@ SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
 	new_timer->it_id = (timer_t) new_timer_id;
 	new_timer->it_clock = which_clock;
 	new_timer->it_overrun = -1;
-	error = CLOCK_DISPATCH(which_clock, timer_create, (new_timer));
-	if (error)
-		goto out;
 
-	/*
-	 * return the timer_id now.  The next step is hard to
-	 * back out if there is an error.
-	 */
 	if (copy_to_user(created_timer_id,
 			 &new_timer_id, sizeof (new_timer_id))) {
 		error = -EFAULT;
@@ -596,6 +604,10 @@ SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
 	new_timer->sigq->info.si_value = event.sigev_value;
 	new_timer->sigq->info.si_tid   = new_timer->it_id;
 	new_timer->sigq->info.si_code  = SI_TIMER;
+
+	error = CLOCK_DISPATCH(which_clock, timer_create, (new_timer));
+	if (error)
+		goto out;
 
 	spin_lock_irq(&current->sighand->siglock);
 	new_timer->it_signal = current->signal;

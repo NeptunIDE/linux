@@ -72,6 +72,8 @@ static unsigned int min_slot_table_size = RPC_MIN_SLOT_TABLE;
 static unsigned int max_slot_table_size = RPC_MAX_SLOT_TABLE;
 static unsigned int xprt_min_resvport_limit = RPC_MIN_RESVPORT;
 static unsigned int xprt_max_resvport_limit = RPC_MAX_RESVPORT;
+static int xprt_min_abort_timeout = RPC_MIN_ABORT_TIMEOUT;
+static int xprt_max_abort_timeout = RPC_MAX_ABORT_TIMEOUT;
 
 static struct ctl_table_header *sunrpc_table_header;
 
@@ -123,6 +125,16 @@ static ctl_table xs_tunables_table[] = {
 		.strategy	= &sysctl_intvec,
 		.extra1		= &xprt_min_resvport_limit,
 		.extra2		= &xprt_max_resvport_limit
+	},
+	{
+		.procname	= "abort_timeout",
+		.data		= &xprt_abort_timeout,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_minmax,
+		.strategy	= &sysctl_intvec,
+		.extra1		= &xprt_min_abort_timeout,
+		.extra2		= &xprt_max_abort_timeout
 	},
 	{
 		.procname	= "tcp_fin_timeout",
@@ -238,7 +250,8 @@ struct sock_xprt {
 	 * State of TCP reply receive
 	 */
 	__be32			tcp_fraghdr,
-				tcp_xid;
+				tcp_xid,
+				tcp_calldir;
 
 	u32			tcp_offset,
 				tcp_reclen;
@@ -736,16 +749,22 @@ static void xs_restore_old_callbacks(struct sock_xprt *transport, struct sock *s
 
 static void xs_reset_transport(struct sock_xprt *transport)
 {
-	struct socket *sock = transport->sock;
-	struct sock *sk = transport->inet;
+	struct rpc_xprt *xprt = &transport->xprt;
+	struct socket *sock;
+	struct sock *sk;
 
-	if (sk == NULL)
+	spin_lock_bh(&xprt->transport_lock);
+	if (transport->sock == NULL) {
+		spin_unlock_bh(&xprt->transport_lock);
 		return;
-
-	write_lock_bh(&sk->sk_callback_lock);
+	}
+	sock = transport->sock;
+	sk = transport->inet;
 	transport->inet = NULL;
 	transport->sock = NULL;
+	spin_unlock_bh(&xprt->transport_lock);
 
+	write_lock_bh(&sk->sk_callback_lock);
 	sk->sk_user_data = NULL;
 
 	xs_restore_old_callbacks(transport, sk);
@@ -807,6 +826,7 @@ static void xs_destroy(struct rpc_xprt *xprt)
 	xs_close(xprt);
 	xs_free_peer_addresses(xprt);
 	kfree(xprt->slot);
+	put_ve(xprt->owner_env);
 	kfree(xprt);
 	module_put(THIS_MODULE);
 }
@@ -961,7 +981,7 @@ static inline void xs_tcp_read_calldir(struct sock_xprt *transport,
 {
 	size_t len, used;
 	u32 offset;
-	__be32	calldir;
+	char *p;
 
 	/*
 	 * We want transport->tcp_offset to be 8 at the end of this routine
@@ -970,26 +990,33 @@ static inline void xs_tcp_read_calldir(struct sock_xprt *transport,
 	 * transport->tcp_offset is 4 (after having already read the xid).
 	 */
 	offset = transport->tcp_offset - sizeof(transport->tcp_xid);
-	len = sizeof(calldir) - offset;
+	len = sizeof(transport->tcp_calldir) - offset;
 	dprintk("RPC:       reading CALL/REPLY flag (%Zu bytes)\n", len);
-	used = xdr_skb_read_bits(desc, &calldir, len);
+	p = ((char *) &transport->tcp_calldir) + offset;
+	used = xdr_skb_read_bits(desc, p, len);
 	transport->tcp_offset += used;
 	if (used != len)
 		return;
 	transport->tcp_flags &= ~TCP_RCV_READ_CALLDIR;
-	transport->tcp_flags |= TCP_RCV_COPY_CALLDIR;
-	transport->tcp_flags |= TCP_RCV_COPY_DATA;
 	/*
 	 * We don't yet have the XDR buffer, so we will write the calldir
 	 * out after we get the buffer from the 'struct rpc_rqst'
 	 */
-	if (ntohl(calldir) == RPC_REPLY)
+	switch (ntohl(transport->tcp_calldir)) {
+	case RPC_REPLY:
+		transport->tcp_flags |= TCP_RCV_COPY_CALLDIR;
+		transport->tcp_flags |= TCP_RCV_COPY_DATA;
 		transport->tcp_flags |= TCP_RPC_REPLY;
-	else
+		break;
+	case RPC_CALL:
+		transport->tcp_flags |= TCP_RCV_COPY_CALLDIR;
+		transport->tcp_flags |= TCP_RCV_COPY_DATA;
 		transport->tcp_flags &= ~TCP_RPC_REPLY;
-	dprintk("RPC:       reading %s CALL/REPLY flag %08x\n",
-			(transport->tcp_flags & TCP_RPC_REPLY) ?
-				"reply for" : "request with", calldir);
+		break;
+	default:
+		dprintk("RPC:       invalid request message type\n");
+		xprt_force_disconnect(&transport->xprt);
+	}
 	xs_tcp_check_fraghdr(transport);
 }
 
@@ -1009,12 +1036,10 @@ static inline void xs_tcp_read_common(struct rpc_xprt *xprt,
 		/*
 		 * Save the RPC direction in the XDR buffer
 		 */
-		__be32	calldir = transport->tcp_flags & TCP_RPC_REPLY ?
-					htonl(RPC_REPLY) : 0;
-
 		memcpy(rcvbuf->head[0].iov_base + transport->tcp_copied,
-			&calldir, sizeof(calldir));
-		transport->tcp_copied += sizeof(calldir);
+			&transport->tcp_calldir,
+			sizeof(transport->tcp_calldir));
+		transport->tcp_copied += sizeof(transport->tcp_calldir);
 		transport->tcp_flags &= ~TCP_RCV_COPY_CALLDIR;
 	}
 
@@ -1703,7 +1728,12 @@ static void xs_udp_connect_worker4(struct work_struct *work)
 	struct rpc_xprt *xprt = &transport->xprt;
 	struct socket *sock = transport->sock;
 	int err, status = -EIO;
+	struct ve_struct *ve;
 
+	ve = set_exec_env(xprt->owner_env);
+	down_read(&xprt->owner_env->op_sem);
+	if (!xprt->owner_env->is_running)
+		goto out;
 	if (xprt->shutdown)
 		goto out;
 
@@ -1715,6 +1745,7 @@ static void xs_udp_connect_worker4(struct work_struct *work)
 		dprintk("RPC:       can't create UDP transport socket (%d).\n", -err);
 		goto out;
 	}
+	sk_change_net_get(sock->sk, xprt->owner_env->ve_netns);
 	xs_reclassify_socket4(sock);
 
 	if (xs_bind4(transport, sock)) {
@@ -1733,6 +1764,8 @@ static void xs_udp_connect_worker4(struct work_struct *work)
 out:
 	xprt_clear_connecting(xprt);
 	xprt_wake_pending_tasks(xprt, status);
+	up_read(&xprt->owner_env->op_sem);
+	(void)set_exec_env(ve);
 }
 
 /**
@@ -1748,7 +1781,12 @@ static void xs_udp_connect_worker6(struct work_struct *work)
 	struct rpc_xprt *xprt = &transport->xprt;
 	struct socket *sock = transport->sock;
 	int err, status = -EIO;
+	struct ve_struct *ve;
 
+	ve = set_exec_env(xprt->owner_env);
+	down_read(&xprt->owner_env->op_sem);
+	if (!xprt->owner_env->is_running)
+		goto out;
 	if (xprt->shutdown)
 		goto out;
 
@@ -1760,6 +1798,7 @@ static void xs_udp_connect_worker6(struct work_struct *work)
 		dprintk("RPC:       can't create UDP transport socket (%d).\n", -err);
 		goto out;
 	}
+	sk_change_net_get(sock->sk, xprt->owner_env->ve_netns);
 	xs_reclassify_socket6(sock);
 
 	if (xs_bind6(transport, sock) < 0) {
@@ -1778,6 +1817,8 @@ static void xs_udp_connect_worker6(struct work_struct *work)
 out:
 	xprt_clear_connecting(xprt);
 	xprt_wake_pending_tasks(xprt, status);
+	up_read(&xprt->owner_env->op_sem);
+	(void)set_exec_env(ve);
 }
 
 /*
@@ -1873,7 +1914,12 @@ static void xs_tcp_setup_socket(struct rpc_xprt *xprt,
 {
 	struct socket *sock = transport->sock;
 	int status = -EIO;
+	struct ve_struct *ve;
 
+	ve = set_exec_env(xprt->owner_env);
+	down_read(&xprt->owner_env->op_sem);
+	if (!xprt->owner_env->is_running)
+		goto out;
 	if (xprt->shutdown)
 		goto out;
 
@@ -1925,13 +1971,22 @@ static void xs_tcp_setup_socket(struct rpc_xprt *xprt,
 	case -EINPROGRESS:
 	case -EALREADY:
 		xprt_clear_connecting(xprt);
+		up_read(&xprt->owner_env->op_sem);
+		(void)set_exec_env(ve);
 		return;
+	case -EINVAL:
+		/* Happens, for instance, if the user specified a link
+		 * local IPv6 address without a scope-id.
+		 */
+		goto out;
 	}
 out_eagain:
 	status = -EAGAIN;
 out:
 	xprt_clear_connecting(xprt);
 	xprt_wake_pending_tasks(xprt, status);
+	up_read(&xprt->owner_env->op_sem);
+	(void)set_exec_env(ve);
 }
 
 static struct socket *xs_create_tcp_sock4(struct rpc_xprt *xprt,
@@ -1947,6 +2002,7 @@ static struct socket *xs_create_tcp_sock4(struct rpc_xprt *xprt,
 				-err);
 		goto out_err;
 	}
+	sk_change_net_get(sock->sk, xprt->owner_env->ve_netns);
 	xs_reclassify_socket4(sock);
 
 	if (xs_bind4(transport, sock) < 0) {
@@ -1986,6 +2042,7 @@ static struct socket *xs_create_tcp_sock6(struct rpc_xprt *xprt,
 				-err);
 		goto out_err;
 	}
+	sk_change_net_get(sock->sk, xprt->owner_env->ve_netns);
 	xs_reclassify_socket6(sock);
 
 	if (xs_bind6(transport, sock) < 0) {

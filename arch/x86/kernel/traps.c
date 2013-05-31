@@ -405,7 +405,8 @@ static notrace __kprobes void default_do_nmi(struct pt_regs *regs)
 		 * Ok, so this is none of the documented NMI sources,
 		 * so it must be the NMI watchdog.
 		 */
-		if (nmi_watchdog_tick(regs, reason))
+		if (nmi_watchdog_tick(regs, reason) +
+				do_nmi_show_regs(regs, cpu))
 			return;
 		if (!do_nmi_callback(regs, cpu))
 			unknown_nmi_error(reason, regs);

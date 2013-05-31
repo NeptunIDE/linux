@@ -105,6 +105,7 @@ static inline void vm_events_fold_cpu(int cpu)
 }
 #endif
 
+extern unsigned long vm_events(enum vm_event_item i);
 #else
 
 /* Disable counters */
@@ -127,6 +128,7 @@ static inline void vm_events_fold_cpu(int cpu)
 {
 }
 
+static inline unsigned long vm_events(enum vm_event_item i) { return 0; }
 #endif /* CONFIG_VM_EVENT_COUNTERS */
 
 #define __count_zone_vm_events(item, zone, delta) \
@@ -160,6 +162,28 @@ static inline unsigned long zone_page_state(struct zone *zone,
 {
 	long x = atomic_long_read(&zone->vm_stat[item]);
 #ifdef CONFIG_SMP
+	if (x < 0)
+		x = 0;
+#endif
+	return x;
+}
+
+/*
+ * More accurate version that also considers the currently pending
+ * deltas. For that we need to loop over all cpus to find the current
+ * deltas. There is no synchronization so the result cannot be
+ * exactly accurate either.
+ */
+static inline unsigned long zone_page_state_snapshot(struct zone *zone,
+					enum zone_stat_item item)
+{
+	long x = atomic_long_read(&zone->vm_stat[item]);
+
+#ifdef CONFIG_SMP
+	int cpu;
+	for_each_online_cpu(cpu)
+		x += zone_pcp(zone, cpu)->vm_stat_diff[item];
+
 	if (x < 0)
 		x = 0;
 #endif

@@ -24,7 +24,7 @@ static inline cycles_t get_cycles(void)
 	unsigned long long ret = 0;
 
 #ifndef CONFIG_X86_TSC
-	if (!cpu_has_tsc)
+	if (WARN_ON_ONCE(!cpu_has_tsc))
 		return 0;
 #endif
 	rdtscll(ret);
@@ -59,5 +59,7 @@ extern void check_tsc_sync_source(int cpu);
 extern void check_tsc_sync_target(void);
 
 extern int notsc_setup(char *);
+extern void save_sched_clock_state(void);
+extern void restore_sched_clock_state(void);
 
 #endif /* _ASM_X86_TSC_H */

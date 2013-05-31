@@ -689,7 +689,7 @@ show_signal_msg(struct pt_regs *regs, unsigned long error_code,
 	if (!printk_ratelimit())
 		return;
 
-	printk("%s%s[%d]: segfault at %lx ip %p sp %p error %lx",
+	ve_printk(VE_LOG, "%s%s[%d]: segfault at %lx ip %p sp %p error %lx",
 		task_pid_nr(tsk) > 1 ? KERN_INFO : KERN_EMERG,
 		tsk->comm, task_pid_nr(tsk), address,
 		(void *)regs->ip, (void *)regs->sp, error_code);
@@ -801,8 +801,10 @@ do_sigbus(struct pt_regs *regs, unsigned long error_code, unsigned long address,
 	up_read(&mm->mmap_sem);
 
 	/* Kernel mode? Handle exceptions or die: */
-	if (!(error_code & PF_USER))
+	if (!(error_code & PF_USER)) {
 		no_context(regs, error_code, address);
+		return;
+	}
 
 	/* User-space => ok to do another page fault: */
 	if (is_prefetch(regs, error_code, address))
@@ -909,7 +911,7 @@ spurious_fault(unsigned long error_code, unsigned long address)
 	return ret;
 }
 
-int show_unhandled_signals = 1;
+int show_unhandled_signals = 0;
 
 static inline int
 access_error(unsigned long error_code, int write, struct vm_area_struct *vma)

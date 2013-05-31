@@ -52,6 +52,8 @@ static struct rpc_wait_queue delay_queue;
  * rpciod-related stuff
  */
 struct workqueue_struct *rpciod_workqueue;
+DECLARE_RWSEM(rpc_async_task_lock);
+EXPORT_SYMBOL(rpc_async_task_lock);
 
 /*
  * Disable the timer for a given RPC task. Should be called with
@@ -606,13 +608,28 @@ static void __rpc_execute(struct rpc_task *task)
 	struct rpc_wait_queue *queue;
 	int task_is_async = RPC_IS_ASYNC(task);
 	int status = 0;
+	struct ve_struct *env;
 
+	env = set_exec_env(task->tk_client->cl_xprt->owner_env);
 	dprintk("RPC: %5u __rpc_execute flags=0x%x\n",
 			task->tk_pid, task->tk_flags);
 
 	BUG_ON(RPC_IS_QUEUED(task));
 
 	for (;;) {
+
+		/*
+		 * Finish this task with error state if RPC client is already
+		 * broken.
+		 */
+		if (task->tk_client->cl_broken) {
+			dprintk("RPC: client 0x%p is broken. Drop task %d "
+				"with EIO.",
+					task->tk_client, task->tk_pid);
+			task->tk_flags |= RPC_TASK_KILLED;
+			rpc_exit(task, -EIO);
+			break;
+		}	
 
 		/*
 		 * Execute any pending callback.
@@ -662,8 +679,10 @@ static void __rpc_execute(struct rpc_task *task)
 		}
 		rpc_clear_running(task);
 		spin_unlock_bh(&queue->lock);
-		if (task_is_async)
+		if (task_is_async) {
+			(void)set_exec_env(env);
 			return;
+		}
 
 		/* sync task: sleep here */
 		dprintk("RPC: %5u sync task going to sleep\n", task->tk_pid);
@@ -690,6 +709,7 @@ static void __rpc_execute(struct rpc_task *task)
 			task->tk_status);
 	/* Release all resources associated with the task */
 	rpc_release_task(task);
+	(void)set_exec_env(env);
 }
 
 /*
@@ -710,7 +730,9 @@ void rpc_execute(struct rpc_task *task)
 
 static void rpc_async_schedule(struct work_struct *work)
 {
+	down_read(&rpc_async_task_lock);
 	__rpc_execute(container_of(work, struct rpc_task, u.tk_work));
+	up_read(&rpc_async_task_lock);
 }
 
 /**
@@ -945,6 +967,16 @@ void rpc_killall_tasks(struct rpc_clnt *clnt)
 	spin_unlock(&clnt->cl_lock);
 }
 EXPORT_SYMBOL_GPL(rpc_killall_tasks);
+
+void rpc_kill_client(struct rpc_clnt *clnt)
+{
+	if (!IS_ERR(clnt)) {
+		clnt->cl_broken = 1;
+		clnt->cl_pr_time = jiffies - xprt_abort_timeout * HZ - 1;
+		rpc_killall_tasks(clnt);
+	}
+}
+EXPORT_SYMBOL_GPL(rpc_kill_client);
 
 int rpciod_up(void)
 {

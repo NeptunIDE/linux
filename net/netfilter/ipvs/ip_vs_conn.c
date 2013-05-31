@@ -146,6 +146,7 @@ static inline int ip_vs_conn_hash(struct ip_vs_conn *cp)
 	hash = ip_vs_conn_hashkey(cp->af, cp->protocol, &cp->caddr, cp->cport);
 
 	ct_write_lock(hash);
+	spin_lock(&cp->lock);
 
 	if (!(cp->flags & IP_VS_CONN_F_HASHED)) {
 		list_add(&cp->c_list, &ip_vs_conn_tab[hash]);
@@ -158,6 +159,7 @@ static inline int ip_vs_conn_hash(struct ip_vs_conn *cp)
 		ret = 0;
 	}
 
+	spin_unlock(&cp->lock);
 	ct_write_unlock(hash);
 
 	return ret;
@@ -177,6 +179,7 @@ static inline int ip_vs_conn_unhash(struct ip_vs_conn *cp)
 	hash = ip_vs_conn_hashkey(cp->af, cp->protocol, &cp->caddr, cp->cport);
 
 	ct_write_lock(hash);
+	spin_lock(&cp->lock);
 
 	if (cp->flags & IP_VS_CONN_F_HASHED) {
 		list_del(&cp->c_list);
@@ -186,6 +189,7 @@ static inline int ip_vs_conn_unhash(struct ip_vs_conn *cp)
 	} else
 		ret = 0;
 
+	spin_unlock(&cp->lock);
 	ct_write_unlock(hash);
 
 	return ret;
@@ -1070,7 +1074,7 @@ int __init ip_vs_conn_init(void)
 	/* Allocate ip_vs_conn slab cache */
 	ip_vs_conn_cachep = kmem_cache_create("ip_vs_conn",
 					      sizeof(struct ip_vs_conn), 0,
-					      SLAB_HWCACHE_ALIGN, NULL);
+					      SLAB_HWCACHE_ALIGN|SLAB_UBC, NULL);
 	if (!ip_vs_conn_cachep) {
 		vfree(ip_vs_conn_tab);
 		return -ENOMEM;

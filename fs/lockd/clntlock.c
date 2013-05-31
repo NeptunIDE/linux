@@ -78,8 +78,12 @@ EXPORT_SYMBOL_GPL(nlmclnt_init);
  */
 void nlmclnt_done(struct nlm_host *host)
 {
+	struct ve_struct *old_ve;
+
 	nlm_release_host(host);
+	old_ve = set_exec_env(host->owner_env);
 	lockd_down();
+	(void)set_exec_env(old_ve);
 }
 EXPORT_SYMBOL_GPL(nlmclnt_done);
 

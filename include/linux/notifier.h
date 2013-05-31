@@ -153,8 +153,9 @@ extern int __srcu_notifier_call_chain(struct srcu_notifier_head *nh,
 
 #define NOTIFY_DONE		0x0000		/* Don't care */
 #define NOTIFY_OK		0x0001		/* Suits me */
+#define NOTIFY_FAIL		0x0002		/* Reject */
 #define NOTIFY_STOP_MASK	0x8000		/* Don't call further */
-#define NOTIFY_BAD		(NOTIFY_STOP_MASK|0x0002)
+#define NOTIFY_BAD		(NOTIFY_STOP_MASK|NOTIFY_FAIL)
 						/* Bad/Veto action */
 /*
  * Clean way to return from the notifier and stop further calls.
@@ -201,6 +202,7 @@ static inline int notifier_to_errno(int ret)
 #define NETDEV_PRE_UP		0x000D
 #define NETDEV_BONDING_OLDTYPE  0x000E
 #define NETDEV_BONDING_NEWTYPE  0x000F
+#define NETDEV_NOTIFY_PEERS	0x0013
 
 #define SYS_DOWN	0x0001	/* Notify of system down */
 #define SYS_RESTART	SYS_DOWN

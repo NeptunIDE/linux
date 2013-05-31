@@ -27,6 +27,7 @@
 #include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/freezer.h>
+#include <linux/ve_proto.h>
 
 #include <linux/sunrpc/types.h>
 #include <linux/sunrpc/stats.h>
@@ -47,18 +48,21 @@ struct nlmsvc_binding *		nlmsvc_ops;
 EXPORT_SYMBOL_GPL(nlmsvc_ops);
 
 static DEFINE_MUTEX(nlmsvc_mutex);
-static unsigned int		nlmsvc_users;
-static struct task_struct	*nlmsvc_task;
-static struct svc_rqst		*nlmsvc_rqst;
-unsigned long			nlmsvc_timeout;
 
 /*
  * These can be set at insmod time (useful for NFS as root filesystem),
  * and also changed through the sysctl interface.  -- Jamie Lokier, Aug 2003
  */
-static unsigned long		nlm_grace_period;
 static unsigned long		nlm_timeout = LOCKD_DFLT_TIMEO;
 static int			nlm_udpport, nlm_tcpport;
+
+#ifndef CONFIG_VE
+static unsigned int		_nlmsvc_users;
+static struct task_struct	*_nlmsvc_task;
+static struct svc_rqst		*_nlmsvc_rqst;
+static unsigned long		_nlmsvc_grace_period;
+unsigned long			_nlmsvc_timeout;
+#endif
 
 /* RLIM_NOFILE defaults to 1024. That seems like a reasonable default here. */
 static unsigned int		nlm_max_connections = 1024;
@@ -66,6 +70,7 @@ static unsigned int		nlm_max_connections = 1024;
 /*
  * Constants needed for the sysctl interface.
  */
+static unsigned long		nlm_grace_period;
 static const unsigned long	nlm_grace_period_min = 0;
 static const unsigned long	nlm_grace_period_max = 240;
 static const unsigned long	nlm_timeout_min = 3;
@@ -176,8 +181,9 @@ lockd(void *vrqstp)
 		}
 		if (err < 0) {
 			if (err != preverr) {
-				printk(KERN_WARNING "%s: unexpected error "
-					"from svc_recv (%d)\n", __func__, err);
+				printk(KERN_WARNING "%s: ct%d unexpected error "
+					"from svc_recv (%d)\n", __func__,
+					get_exec_env()->veid, err);
 				preverr = err;
 			}
 			schedule_timeout_interruptible(HZ);
@@ -280,12 +286,14 @@ int lockd_up(void)
 	 */
 	if (nlmsvc_users)
 		printk(KERN_WARNING
-			"lockd_up: no pid, %d users??\n", nlmsvc_users);
+			"lockd_up: ct%d no pid, %d users??\n",
+			get_exec_env()->veid, nlmsvc_users);
 
 	error = -ENOMEM;
 	serv = svc_create(&nlmsvc_program, LOCKD_BUFSIZE, NULL);
 	if (!serv) {
-		printk(KERN_WARNING "lockd_up: create service failed\n");
+		printk(KERN_WARNING "lockd_up: ct%d create service failed\n",
+				get_exec_env()->veid);
 		goto out;
 	}
 
@@ -301,22 +309,23 @@ int lockd_up(void)
 		error = PTR_ERR(nlmsvc_rqst);
 		nlmsvc_rqst = NULL;
 		printk(KERN_WARNING
-			"lockd_up: svc_rqst allocation failed, error=%d\n",
-			error);
+			"lockd_up: ct%d svc_rqst allocation failed, error=%d\n",
+			get_exec_env()->veid, error);
 		goto destroy_and_out;
 	}
 
 	svc_sock_update_bufs(serv);
 	serv->sv_maxconn = nlm_max_connections;
 
-	nlmsvc_task = kthread_run(lockd, nlmsvc_rqst, serv->sv_name);
+	nlmsvc_task = kthread_run_ve(get_exec_env(), lockd, nlmsvc_rqst, serv->sv_name);
 	if (IS_ERR(nlmsvc_task)) {
 		error = PTR_ERR(nlmsvc_task);
 		svc_exit_thread(nlmsvc_rqst);
 		nlmsvc_task = NULL;
 		nlmsvc_rqst = NULL;
 		printk(KERN_WARNING
-			"lockd_up: kthread_run failed, error=%d\n", error);
+			"lockd_up: ct%d kthread_run failed, error=%d\n",
+			get_exec_env()->veid, error);
 		goto destroy_and_out;
 	}
 
@@ -345,14 +354,15 @@ lockd_down(void)
 		if (--nlmsvc_users)
 			goto out;
 	} else {
-		printk(KERN_ERR "lockd_down: no users! task=%p\n",
-			nlmsvc_task);
-		BUG();
+		printk(KERN_ERR "lockd_down: ct%d no users! task=%p\n",
+			get_exec_env()->veid, nlmsvc_task);
+		goto out;
 	}
 
 	if (!nlmsvc_task) {
-		printk(KERN_ERR "lockd_down: no lockd running.\n");
-		BUG();
+		printk(KERN_ERR "lockd_down: ct%d no lockd running.\n",
+				get_exec_env()->veid);
+		goto out;
 	}
 	kthread_stop(nlmsvc_task);
 	svc_exit_thread(nlmsvc_rqst);
@@ -497,6 +507,29 @@ static int lockd_authenticate(struct svc_rqst *rqstp)
 	return SVC_DENIED;
 }
 
+#ifdef CONFIG_VE
+extern void ve_nlm_shutdown_hosts(struct ve_struct *ve);
+
+static int ve_lockd_start(void *data)
+{
+	return 0;
+}
+
+static void ve_lockd_stop(void *data)
+{
+	struct ve_struct *ve = (struct ve_struct *)data;
+
+	ve_nlm_shutdown_hosts(ve);
+	flush_scheduled_work();
+}
+
+static struct ve_hook lockd_hook = {
+	.init	  = ve_lockd_start,
+	.fini	  = ve_lockd_stop,
+	.owner	  = THIS_MODULE,
+	.priority = HOOK_PRIO_NET,
+};
+#endif
 
 param_set_min_max(port, int, simple_strtol, 0, 65535)
 param_set_min_max(grace_period, unsigned long, simple_strtoul,
@@ -525,16 +558,20 @@ module_param(nlm_max_connections, uint, 0644);
 
 static int __init init_nlm(void)
 {
+	ve_hook_register(VE_SS_CHAIN, &lockd_hook);
 #ifdef CONFIG_SYSCTL
 	nlm_sysctl_table = register_sysctl_table(nlm_sysctl_root);
-	return nlm_sysctl_table ? 0 : -ENOMEM;
-#else
-	return 0;
+	if (nlm_sysctl_table == NULL) {
+		ve_hook_unregister(&lockd_hook);
+		return -ENOMEM;
+	}
 #endif
+	return 0;
 }
 
 static void __exit exit_nlm(void)
 {
+	ve_hook_unregister(&lockd_hook);
 	/* FIXME: delete all NLM clients */
 	nlm_shutdown_hosts();
 #ifdef CONFIG_SYSCTL

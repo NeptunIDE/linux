@@ -106,6 +106,14 @@ struct page {
 	 */
 	void *shadow;
 #endif
+#ifdef CONFIG_BEANCOUNTERS
+	/* FIXME: switch to mainline memcgroup */
+	union {
+		struct user_beancounter *page_ub;
+		struct page_beancounter *page_pb;
+		struct user_beancounter **slub_ubs;
+	} bc;
+#endif
 };
 
 /*
@@ -139,7 +147,7 @@ struct vm_area_struct {
 					   within vm_mm. */
 
 	/* linked list of VM areas per task, sorted by address */
-	struct vm_area_struct *vm_next;
+	struct vm_area_struct *vm_next, *vm_prev;
 
 	pgprot_t vm_page_prot;		/* Access permissions of this VMA. */
 	unsigned long vm_flags;		/* Flags, see mm.h. */
@@ -262,6 +270,12 @@ struct mm_struct {
 
 	unsigned long flags; /* Must use atomic bitops to access the bits */
 
+	unsigned int vps_dumpable:2;
+	unsigned int oom_killed:1;
+
+#ifdef CONFIG_BEANCOUNTERS
+	struct user_beancounter *mm_ub;
+#endif
 	struct core_state *core_state; /* coredumping support */
 #ifdef CONFIG_AIO
 	spinlock_t		ioctx_lock;

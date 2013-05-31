@@ -53,6 +53,9 @@
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 
+#include <linux/ve_task.h>
+#include <linux/vzcalluser.h>
+
 #define PPP_VERSION	"2.4.2"
 
 /*
@@ -366,8 +369,10 @@ static int ppp_open(struct inode *inode, struct file *file)
 	/*
 	 * This could (should?) be enforced by the permissions on /dev/ppp.
 	 */
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
+	if (!net_generic(get_exec_env()->ve_netns, ppp_net_id)) /* no VE_FEATURE_PPP */
+		return -EACCES;
 	return 0;
 }
 
@@ -867,6 +872,9 @@ static __net_init int ppp_init_net(struct net *net)
 	struct ppp_net *pn;
 	int err;
 
+	if (!(get_exec_env()->features & VE_FEATURE_PPP))
+		return 0;
+
 	pn = kzalloc(sizeof(*pn), GFP_KERNEL);
 	if (!pn)
 		return -ENOMEM;
@@ -893,6 +901,9 @@ static __net_exit void ppp_exit_net(struct net *net)
 	struct ppp_net *pn;
 
 	pn = net_generic(net, ppp_net_id);
+	if (!pn) /* no VE_FEATURE_PPP */
+		return;
+
 	idr_destroy(&pn->units_idr);
 	/*
 	 * if someone has cached our net then
@@ -1053,7 +1064,7 @@ static void ppp_setup(struct net_device *dev)
 	dev->tx_queue_len = 3;
 	dev->type = ARPHRD_PPP;
 	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
-	dev->features |= NETIF_F_NETNS_LOCAL;
+	dev->features |= NETIF_F_NETNS_LOCAL | NETIF_F_VIRTUAL;
 	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
 }
 
@@ -2568,16 +2579,16 @@ ppp_create_interface(struct net *net, int unit, int *retp)
 	 */
 	dev_net_set(dev, net);
 
-	ret = -EEXIST;
 	mutex_lock(&pn->all_ppp_mutex);
 
 	if (unit < 0) {
 		unit = unit_get(&pn->units_idr, ppp);
 		if (unit < 0) {
-			*retp = unit;
+			ret = unit;
 			goto out2;
 		}
 	} else {
+		ret = -EEXIST;
 		if (unit_find(&pn->units_idr, unit))
 			goto out2; /* unit already exists */
 		/*
@@ -2652,10 +2663,10 @@ static void ppp_shutdown_interface(struct ppp *ppp)
 		ppp->closing = 1;
 		ppp_unlock(ppp);
 		unregister_netdev(ppp->dev);
+		unit_put(&pn->units_idr, ppp->file.index);
 	} else
 		ppp_unlock(ppp);
 
-	unit_put(&pn->units_idr, ppp->file.index);
 	ppp->file.dead = 1;
 	ppp->owner = NULL;
 	wake_up_interruptible(&ppp->file.rwait);
@@ -2843,8 +2854,7 @@ static void __exit ppp_cleanup(void)
  * by holding all_ppp_mutex
  */
 
-/* associate pointer with specified number */
-static int unit_set(struct idr *p, void *ptr, int n)
+static int __unit_alloc(struct idr *p, void *ptr, int n)
 {
 	int unit, err;
 
@@ -2855,10 +2865,24 @@ again:
 	}
 
 	err = idr_get_new_above(p, ptr, n, &unit);
-	if (err == -EAGAIN)
-		goto again;
+	if (err < 0) {
+		if (err == -EAGAIN)
+			goto again;
+		return err;
+	}
 
-	if (unit != n) {
+	return unit;
+}
+
+/* associate pointer with specified number */
+static int unit_set(struct idr *p, void *ptr, int n)
+{
+	int unit;
+
+	unit = __unit_alloc(p, ptr, n);
+	if (unit < 0)
+		return unit;
+	else if (unit != n) {
 		idr_remove(p, unit);
 		return -EINVAL;
 	}
@@ -2869,19 +2893,7 @@ again:
 /* get new free unit number and associate pointer with it */
 static int unit_get(struct idr *p, void *ptr)
 {
-	int unit, err;
-
-again:
-	if (!idr_pre_get(p, GFP_KERNEL)) {
-		printk(KERN_ERR "PPP: No free memory for idr\n");
-		return -ENOMEM;
-	}
-
-	err = idr_get_new_above(p, ptr, 0, &unit);
-	if (err == -EAGAIN)
-		goto again;
-
-	return unit;
+	return __unit_alloc(p, ptr, 0);
 }
 
 /* put unit number back to a pool */
