@@ -31,7 +31,7 @@
 #include <stdlib.h>
 
 #include <linux/types.h>
-#include <linux/videodev.h>
+#include <libv4l1-videodev.h>
 
 #define VIDEO_DEV "/dev/video0"
 
