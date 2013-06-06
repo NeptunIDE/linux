@@ -331,7 +331,7 @@ static int au_wbr_init(struct au_branch *br, struct super_block *sb,
 	 * cf. AUFS_MAX_NAMELEN in include/linux/aufs_type.h
 	 */
 	h_dentry = path->dentry;
-	err = vfs_statfs(h_dentry, &kst);
+	err = vfs_statfs(path, &kst);
 	if (unlikely(err))
 		goto out;
 	err = -EINVAL;
