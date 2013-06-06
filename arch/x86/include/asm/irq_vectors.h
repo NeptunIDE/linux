@@ -1,6 +1,7 @@
 #ifndef _ASM_X86_IRQ_VECTORS_H
 #define _ASM_X86_IRQ_VECTORS_H
 
+#include <linux/threads.h>
 /*
  * Linux IRQ vector layout.
  *
@@ -16,8 +17,8 @@
  *  Vectors   0 ...  31 : system traps and exceptions - hardcoded events
  *  Vectors  32 ... 127 : device interrupts
  *  Vector  128         : legacy int80 syscall interface
- *  Vectors 129 ... 237 : device interrupts
- *  Vectors 238 ... 255 : special interrupts
+ *  Vectors 129 ... 229 : device interrupts
+ *  Vectors 230 ... 255 : special interrupts
  *
  * 64-bit x86 has per CPU IDT tables, 32-bit has one shared IDT table.
  *
@@ -91,10 +92,29 @@
 #define THRESHOLD_APIC_VECTOR		0xf9
 #define REBOOT_VECTOR			0xf8
 
-/* f0-f7 used for spreading out TLB flushes: */
-#define INVALIDATE_TLB_VECTOR_END	0xf7
-#define INVALIDATE_TLB_VECTOR_START	0xf0
-#define NUM_INVALIDATE_TLB_VECTORS	   8
+/*
+ * Generic system vector for platform specific use
+ */
+#define X86_PLATFORM_IPI_VECTOR		0xf7
+
+/*
+ * IRQ work vector:
+ */
+#define IRQ_WORK_VECTOR			0xf6
+
+#define UV_BAU_MESSAGE			0xf5
+
+/*
+ * Self IPI vector for machine checks
+ */
+#define MCE_SELF_VECTOR			0xf4
+
+#ifdef CONFIG_XEN
+/* Xen vector callback to receive events in a HVM domain */
+#define XEN_HVM_EVTCHN_CALLBACK		0xf3
+#endif
+
+#define MONITOR_IPI_VECTOR		0xf2
 
 /*
  * Local APIC timer IRQ vector is on a different priority level,
@@ -103,22 +123,11 @@
  */
 #define LOCAL_TIMER_VECTOR		0xef
 
-/*
- * Generic system vector for platform specific use
- */
-#define GENERIC_INTERRUPT_VECTOR	0xed
-
-/*
- * Performance monitoring pending work vector:
- */
-#define LOCAL_PENDING_VECTOR		0xec
-
-#define UV_BAU_MESSAGE			0xec
-
-/*
- * Self IPI vector for machine checks
- */
-#define MCE_SELF_VECTOR			0xeb
+/* f0-f7 used for spreading out TLB flushes: */
+#define NUM_INVALIDATE_TLB_VECTORS	   8
+#define INVALIDATE_TLB_VECTOR_END	0xee
+#define INVALIDATE_TLB_VECTOR_START	\
+	(INVALIDATE_TLB_VECTOR_END - NUM_INVALIDATE_TLB_VECTORS + 1)
 
 /*
  * First APIC vector available to drivers: (vectors 0x30-0xee) we

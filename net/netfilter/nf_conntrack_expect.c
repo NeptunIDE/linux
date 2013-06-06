@@ -32,7 +32,6 @@ unsigned int nf_ct_expect_hsize __read_mostly;
 EXPORT_SYMBOL_GPL(nf_ct_expect_hsize);
 
 static unsigned int nf_ct_expect_hash_rnd __read_mostly;
-unsigned int nf_ct_expect_max __read_mostly;
 static int nf_ct_expect_hash_rnd_initted __read_mostly;
 
 static struct kmem_cache *nf_ct_expect_cachep __read_mostly;
@@ -402,7 +401,7 @@ static inline int __nf_ct_expect_check(struct nf_conntrack_expect *expect)
 		}
 	}
 
-	if (net->ct.expect_count >= nf_ct_expect_max) {
+	if (net->ct.expect_count >= init_net.ct.expect_max) {
 		if (net_ratelimit())
 			printk(KERN_WARNING
 			       "nf_conntrack: expectation table full\n");
@@ -569,7 +568,7 @@ static void exp_proc_remove(struct net *net)
 #endif /* CONFIG_PROC_FS */
 }
 
-module_param_named(expect_hashsize, nf_ct_expect_hsize, uint, 0600);
+module_param_named(expect_hashsize, nf_ct_expect_hsize, uint, 0400);
 
 int nf_conntrack_expect_init(struct net *net)
 {
@@ -577,14 +576,15 @@ int nf_conntrack_expect_init(struct net *net)
 
 	if (net_eq(net, &init_net)) {
 		if (!nf_ct_expect_hsize) {
-			nf_ct_expect_hsize = nf_conntrack_htable_size / 256;
+			nf_ct_expect_hsize = net->ct.htable_size / 256;
 			if (!nf_ct_expect_hsize)
 				nf_ct_expect_hsize = 1;
 		}
-		nf_ct_expect_max = nf_ct_expect_hsize * 4;
+		init_net.ct.expect_max = nf_ct_expect_hsize * 4;
 	}
 
 	net->ct.expect_count = 0;
+	net->ct.expect_max = init_net.ct.expect_max;
 	net->ct.expect_hash = nf_ct_alloc_hashtable(&nf_ct_expect_hsize,
 						  &net->ct.expect_vmalloc, 0);
 	if (net->ct.expect_hash == NULL)

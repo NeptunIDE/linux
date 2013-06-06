@@ -42,11 +42,11 @@ static int fat_ioctl_set_attributes(struct file *file, u32 __user *user_attr)
 	if (err)
 		goto out;
 
-	mutex_lock(&inode->i_mutex);
+
 	err = mnt_want_write(file->f_path.mnt);
 	if (err)
-		goto out_unlock_inode;
-
+		goto out;
+	mutex_lock(&inode->i_mutex);
 	/*
 	 * ATTR_VOLUME and ATTR_DIR cannot be changed; this also
 	 * prevents the user from turning us into a VFAT

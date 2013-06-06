@@ -67,28 +67,13 @@ struct ipoib_mcast_iter {
 static void ipoib_mcast_free(struct ipoib_mcast *mcast)
 {
 	struct net_device *dev = mcast->dev;
-	struct ipoib_dev_priv *priv = netdev_priv(dev);
-	struct ipoib_neigh *neigh, *tmp;
 	int tx_dropped = 0;
 
 	ipoib_dbg_mcast(netdev_priv(dev), "deleting multicast group %pI6\n",
 			mcast->mcmember.mgid.raw);
 
-	spin_lock_irq(&priv->lock);
-
-	list_for_each_entry_safe(neigh, tmp, &mcast->neigh_list, list) {
-		/*
-		 * It's safe to call ipoib_put_ah() inside priv->lock
-		 * here, because we know that mcast->ah will always
-		 * hold one more reference, so ipoib_put_ah() will
-		 * never do more than decrement the ref count.
-		 */
-		if (neigh->ah)
-			ipoib_put_ah(neigh->ah);
-		ipoib_neigh_free(dev, neigh);
-	}
-
-	spin_unlock_irq(&priv->lock);
+	/* remove all neigh connected to this mcast */
+	ipoib_del_neighs_by_gid(dev, mcast->mcmember.mgid.raw);
 
 	if (mcast->ah)
 		ipoib_put_ah(mcast->ah);
@@ -238,8 +223,11 @@ static int ipoib_mcast_join_finish(struct ipoib_mcast *mcast,
 		av.grh.dgid = mcast->mcmember.mgid;
 
 		ah = ipoib_create_ah(dev, priv->pd, &av);
-		if (!ah) {
-			ipoib_warn(priv, "ib_address_create failed\n");
+		if (IS_ERR(ah)) {
+			ipoib_warn(priv, "ib_address_create failed %ld\n",
+				-PTR_ERR(ah));
+			/* use original error */
+			return PTR_ERR(ah);
 		} else {
 			spin_lock_irq(&priv->lock);
 			mcast->ah = ah;
@@ -257,17 +245,13 @@ static int ipoib_mcast_join_finish(struct ipoib_mcast *mcast,
 	netif_tx_lock_bh(dev);
 	while (!skb_queue_empty(&mcast->pkt_queue)) {
 		struct sk_buff *skb = skb_dequeue(&mcast->pkt_queue);
+
 		netif_tx_unlock_bh(dev);
 
 		skb->dev = dev;
-
-		if (!skb_dst(skb) || !skb_dst(skb)->neighbour) {
-			/* put pseudoheader back on for next time */
-			skb_push(skb, sizeof (struct ipoib_pseudoheader));
-		}
-
 		if (dev_queue_xmit(skb))
 			ipoib_warn(priv, "dev_queue_xmit failed to requeue packet\n");
+
 		netif_tx_lock_bh(dev);
 	}
 	netif_tx_unlock_bh(dev);
@@ -654,11 +638,12 @@ static int ipoib_mcast_leave(struct net_device *dev, struct ipoib_mcast *mcast)
 	return 0;
 }
 
-void ipoib_mcast_send(struct net_device *dev, void *mgid, struct sk_buff *skb)
+void ipoib_mcast_send(struct net_device *dev, u8 *daddr, struct sk_buff *skb)
 {
 	struct ipoib_dev_priv *priv = netdev_priv(dev);
 	struct ipoib_mcast *mcast;
 	unsigned long flags;
+	void *mgid = daddr + 4;
 
 	spin_lock_irqsave(&priv->lock, flags);
 
@@ -714,12 +699,13 @@ void ipoib_mcast_send(struct net_device *dev, void *mgid, struct sk_buff *skb)
 
 out:
 	if (mcast && mcast->ah) {
-		if (skb_dst(skb)		&&
-		    skb_dst(skb)->neighbour &&
-		    !*to_ipoib_neigh(skb_dst(skb)->neighbour)) {
-			struct ipoib_neigh *neigh = ipoib_neigh_alloc(skb_dst(skb)->neighbour,
-									skb->dev);
+		struct ipoib_neigh *neigh;
 
+		spin_unlock_irqrestore(&priv->lock, flags);
+		neigh = ipoib_neigh_get(dev, daddr);
+		spin_lock_irqsave(&priv->lock, flags);
+		if (!neigh) {
+			neigh = ipoib_neigh_alloc(daddr, dev);
 			if (neigh) {
 				kref_get(&mcast->ah->ref);
 				neigh->ah	= mcast->ah;
@@ -729,6 +715,8 @@ out:
 
 		spin_unlock_irqrestore(&priv->lock, flags);
 		ipoib_send(dev, skb, mcast->ah, IB_MULTICAST_QPN);
+		if (neigh)
+			ipoib_neigh_put(neigh);
 		return;
 	}
 
@@ -767,11 +755,8 @@ void ipoib_mcast_dev_flush(struct net_device *dev)
 	}
 }
 
-static int ipoib_mcast_addr_is_valid(const u8 *addr, unsigned int addrlen,
-				     const u8 *broadcast)
+static int ipoib_mcast_addr_is_valid(const u8 *addr, const u8 *broadcast)
 {
-	if (addrlen != INFINIBAND_ALEN)
-		return 0;
 	/* reserved QPN, prefix, scope */
 	if (memcmp(addr, broadcast, 6))
 		return 0;
@@ -811,11 +796,10 @@ void ipoib_mcast_restart_task(struct work_struct *work)
 		clear_bit(IPOIB_MCAST_FLAG_FOUND, &mcast->flags);
 
 	/* Mark all of the entries that are found or don't exist */
-	for (mclist = dev->mc_list; mclist; mclist = mclist->next) {
+	netdev_for_each_mc_addr(mclist, dev) {
 		union ib_gid mgid;
 
 		if (!ipoib_mcast_addr_is_valid(mclist->dmi_addr,
-					       mclist->dmi_addrlen,
 					       dev->broadcast))
 			continue;
 

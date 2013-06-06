@@ -16,6 +16,7 @@
 #include <linux/pagemap.h>
 #include <linux/file.h>
 #include <linux/slab.h>
+#include <linux/bio.h>
 
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 
@@ -30,34 +31,67 @@ static struct fuse_conn *fuse_get_conn(struct file *file)
 	return file->private_data;
 }
 
-static void fuse_request_init(struct fuse_req *req)
+static void fuse_request_init(struct fuse_req *req, struct page **pages,
+			      struct fuse_page_desc *page_descs,
+			      unsigned npages)
 {
 	memset(req, 0, sizeof(*req));
+	memset(pages, 0, sizeof(*pages) * npages);
+	memset(page_descs, 0, sizeof(*page_descs) * npages);
 	INIT_LIST_HEAD(&req->list);
 	INIT_LIST_HEAD(&req->intr_entry);
 	init_waitqueue_head(&req->waitq);
 	atomic_set(&req->count, 1);
+	req->pages = pages;
+	req->page_descs = page_descs;
+	req->max_pages = npages;
 }
 
-struct fuse_req *fuse_request_alloc(void)
+static struct fuse_req *__fuse_request_alloc(unsigned npages, gfp_t flags)
 {
-	struct fuse_req *req = kmem_cache_alloc(fuse_req_cachep, GFP_KERNEL);
-	if (req)
-		fuse_request_init(req);
+	struct fuse_req *req = kmem_cache_alloc(fuse_req_cachep, flags);
+	if (req) {
+		struct page **pages;
+		struct fuse_page_desc *page_descs;
+
+		if (npages <= FUSE_REQ_INLINE_PAGES) {
+			pages = req->inline_pages;
+			page_descs = req->inline_page_descs;
+		} else {
+			pages = kmalloc(sizeof(struct page *) * npages, flags);
+			page_descs = kmalloc(sizeof(struct fuse_page_desc) *
+					     npages, flags);
+		}
+
+		if (!pages || !page_descs) {
+			kfree(pages);
+			kfree(page_descs);
+			kmem_cache_free(fuse_req_cachep, req);
+			return NULL;
+		}
+
+		fuse_request_init(req, pages, page_descs, npages);
+	}
 	return req;
+}
+
+struct fuse_req *fuse_request_alloc(unsigned npages)
+{
+	return __fuse_request_alloc(npages, GFP_KERNEL);
 }
 EXPORT_SYMBOL_GPL(fuse_request_alloc);
 
-struct fuse_req *fuse_request_alloc_nofs(void)
+struct fuse_req *fuse_request_alloc_nofs(unsigned npages)
 {
-	struct fuse_req *req = kmem_cache_alloc(fuse_req_cachep, GFP_NOFS);
-	if (req)
-		fuse_request_init(req);
-	return req;
+	return __fuse_request_alloc(npages, GFP_NOFS);
 }
 
 void fuse_request_free(struct fuse_req *req)
 {
+	if (req->pages != req->inline_pages) {
+		kfree(req->pages);
+		kfree(req->page_descs);
+	}
 	kmem_cache_free(fuse_req_cachep, req);
 }
 
@@ -90,10 +124,10 @@ static void fuse_req_init_context(struct fuse_req *req)
 {
 	req->in.h.uid = current_fsuid();
 	req->in.h.gid = current_fsgid();
-	req->in.h.pid = current->pid;
+	req->in.h.pid = task_pid_vnr(current);
 }
 
-struct fuse_req *fuse_get_req(struct fuse_conn *fc)
+struct fuse_req *fuse_get_req(struct fuse_conn *fc, unsigned npages)
 {
 	struct fuse_req *req;
 	sigset_t oldset;
@@ -112,7 +146,7 @@ struct fuse_req *fuse_get_req(struct fuse_conn *fc)
 	if (!fc->connected)
 		goto out;
 
-	req = fuse_request_alloc();
+	req = fuse_request_alloc(npages);
 	err = -ENOMEM;
 	if (!req)
 		goto out;
@@ -162,7 +196,7 @@ static void put_reserved_req(struct fuse_conn *fc, struct fuse_req *req)
 	struct fuse_file *ff = file->private_data;
 
 	spin_lock(&fc->lock);
-	fuse_request_init(req);
+	fuse_request_init(req, req->pages, req->page_descs, req->max_pages);
 	BUG_ON(ff->reserved_req);
 	ff->reserved_req = req;
 	wake_up_all(&fc->reserved_req_waitq);
@@ -183,13 +217,14 @@ static void put_reserved_req(struct fuse_conn *fc, struct fuse_req *req)
  * filesystem should not have it's own file open.  If deadlock is
  * intentional, it can still be broken by "aborting" the filesystem.
  */
-struct fuse_req *fuse_get_req_nofail(struct fuse_conn *fc, struct file *file)
+struct fuse_req *fuse_get_req_nofail_nopages(struct fuse_conn *fc,
+					     struct file *file)
 {
 	struct fuse_req *req;
 
 	atomic_inc(&fc->num_waiting);
 	wait_event(fc->blocked_waitq, !fc->blocked);
-	req = fuse_request_alloc();
+	req = fuse_request_alloc(0);
 	if (!req)
 		req = get_reserved_req(fc, file);
 
@@ -551,10 +586,7 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 		cs->iov++;
 		cs->nr_segs--;
 	}
-	down_read(&current->mm->mmap_sem);
-	err = get_user_pages(current, current->mm, cs->addr, 1, cs->write, 0,
-			     &cs->pg, NULL);
-	up_read(&current->mm->mmap_sem);
+	err = get_user_pages_fast(cs->addr, 1, cs->write, &cs->pg);
 	if (err < 0)
 		return err;
 	BUG_ON(err != 1);
@@ -622,19 +654,35 @@ static int fuse_copy_pages(struct fuse_copy_state *cs, unsigned nbytes,
 {
 	unsigned i;
 	struct fuse_req *req = cs->req;
-	unsigned offset = req->page_offset;
-	unsigned count = min(nbytes, (unsigned) PAGE_SIZE - offset);
 
 	for (i = 0; i < req->num_pages && (nbytes || zeroing); i++) {
+		unsigned offset = req->page_descs[i].offset;
+		unsigned count = min(nbytes, req->page_descs[i].length);
 		struct page *page = req->pages[i];
 		int err = fuse_copy_page(cs, page, offset, count, zeroing);
 		if (err)
 			return err;
 
 		nbytes -= count;
-		count = min(nbytes, (unsigned) PAGE_SIZE);
-		offset = 0;
 	}
+	return 0;
+}
+
+static int fuse_copy_bvec(struct fuse_copy_state *cs, unsigned nbytes,
+			   int zeroing)
+{
+	unsigned i;
+	struct fuse_req *req = cs->req;
+
+	for (i = 0; i < req->num_bvecs && (nbytes || zeroing); i++) {
+		struct bio_vec *bvec = &req->bvec[i];
+
+		int err = fuse_copy_page(cs, bvec->bv_page,
+				bvec->bv_offset, bvec->bv_len, zeroing);
+		if (err)
+			return err;
+	}
+
 	return 0;
 }
 
@@ -654,7 +702,7 @@ static int fuse_copy_one(struct fuse_copy_state *cs, void *val, unsigned size)
 
 /* Copy request arguments to/from userspace buffer */
 static int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
-			  unsigned argpages, struct fuse_arg *args,
+			  unsigned argpages, unsigned argbvec, struct fuse_arg *args,
 			  int zeroing)
 {
 	int err = 0;
@@ -664,6 +712,8 @@ static int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
 		struct fuse_arg *arg = &args[i];
 		if (i == numargs - 1 && argpages)
 			err = fuse_copy_pages(cs, arg->size, zeroing);
+		else if (i == numargs - 1 && argbvec)
+			err = fuse_copy_bvec(cs, arg->size, zeroing);
 		else
 			err = fuse_copy_one(cs, arg->value, arg->size);
 	}
@@ -798,7 +848,7 @@ static ssize_t fuse_dev_read(struct kiocb *iocb, const struct iovec *iov,
 	fuse_copy_init(&cs, fc, 1, req, iov, nr_segs);
 	err = fuse_copy_one(&cs, &in->h, sizeof(in->h));
 	if (!err)
-		err = fuse_copy_args(&cs, in->numargs, in->argpages,
+		err = fuse_copy_args(&cs, in->numargs, in->argpages, in->argbvec,
 				     (struct fuse_arg *) in->args, 0);
 	fuse_copy_finish(&cs);
 	spin_lock(&fc->lock);
@@ -884,10 +934,15 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
 				   struct fuse_copy_state *cs)
 {
 	struct fuse_notify_inval_entry_out outarg;
-	int err = -EINVAL;
-	char buf[FUSE_NAME_MAX+1];
+	int err = -ENOMEM;
+	char *buf;
 	struct qstr name;
 
+	buf = kzalloc(FUSE_NAME_MAX + 1, GFP_KERNEL);
+	if (!buf)
+		goto err;
+
+	err = -EINVAL;
 	if (size < sizeof(outarg))
 		goto err;
 
@@ -897,6 +952,10 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
 
 	err = -ENAMETOOLONG;
 	if (outarg.namelen > FUSE_NAME_MAX)
+		goto err;
+
+	err = -EINVAL;
+	if (size != sizeof(outarg) + outarg.namelen + 1)
 		goto err;
 
 	name.name = buf;
@@ -914,6 +973,38 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
 		goto err_unlock;
 
 	err = fuse_reverse_inval_entry(fc->sb, outarg.parent, &name);
+
+err_unlock:
+	up_read(&fc->killsb);
+	kfree(buf);
+	return err;
+
+err:
+	kfree(buf);
+	fuse_copy_finish(cs);
+	return err;
+}
+
+static int fuse_notify_inval_files(struct fuse_conn *fc, unsigned int size,
+				   struct fuse_copy_state *cs)
+{
+	struct fuse_notify_inval_files_out outarg;
+	int err = -EINVAL;
+
+	if (size != sizeof(outarg))
+		goto err;
+
+	err = fuse_copy_one(cs, &outarg, sizeof(outarg));
+	if (err)
+		goto err;
+	fuse_copy_finish(cs);
+
+	down_read(&fc->killsb);
+	err = -ENOENT;
+	if (!fc->sb)
+		goto err_unlock;
+
+	err = fuse_invalidate_files(fc->sb, outarg.ino);
 
 err_unlock:
 	up_read(&fc->killsb);
@@ -936,6 +1027,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 
 	case FUSE_NOTIFY_INVAL_ENTRY:
 		return fuse_notify_inval_entry(fc, size, cs);
+
+	case FUSE_NOTIFY_INVAL_FILES:
+		return fuse_notify_inval_files(fc, size, cs);
 
 	default:
 		fuse_copy_finish(cs);
@@ -976,8 +1070,8 @@ static int copy_out_args(struct fuse_copy_state *cs, struct fuse_out *out,
 			return -EINVAL;
 		lastarg->size -= diffsize;
 	}
-	return fuse_copy_args(cs, out->numargs, out->argpages, out->args,
-			      out->page_zeroing);
+	return fuse_copy_args(cs, out->numargs, out->argpages, out->argbvec,
+			out->args, out->page_zeroing);
 }
 
 /*
@@ -1121,6 +1215,22 @@ __acquires(&fc->lock)
 	}
 }
 
+static void requeue_requests(struct fuse_conn *fc)
+{
+	BUG_ON(!list_empty(&fc->io));
+	while (!list_empty(&fc->processing)) {
+		struct fuse_req *req;
+
+		/* take requests from the processing queue tail ... */
+		req = list_entry(fc->processing.prev, struct fuse_req, list);
+		BUG_ON(req->locked);
+		BUG_ON(req->state != FUSE_REQ_SENT);
+		/* ... and queue them back to the pending head */
+		req->state = FUSE_REQ_PENDING;
+		list_move(&req->list, &fc->pending);
+	}
+}
+
 /*
  * Abort requests under I/O
  *
@@ -1199,9 +1309,14 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 	struct fuse_conn *fc = fuse_get_conn(file);
 	if (fc) {
 		spin_lock(&fc->lock);
-		fc->connected = 0;
-		end_requests(fc, &fc->pending);
-		end_requests(fc, &fc->processing);
+		if (!(fc->flags & FUSE_CAN_RECONNECT)) {
+			fc->connected = 0;
+			end_requests(fc, &fc->processing);
+			end_requests(fc, &fc->pending);
+		} else {
+			fc->connected = 2;
+			requeue_requests(fc);
+		}
 		spin_unlock(&fc->lock);
 		fuse_conn_put(fc);
 	}
@@ -1209,6 +1324,40 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(fuse_dev_release);
+
+int fuse_reconnect_fd(int fd, struct fuse_conn *fc)
+{
+	int err;
+	struct file *f;
+
+	err = -EBADF;
+	f = fget(fd);
+	if (!f)
+		goto out;
+
+	err = -EINVAL;
+	if (f->f_op != &fuse_dev_operations)
+		goto out_fput;
+
+	mutex_lock(&fuse_mutex);
+	err = -EBUSY;
+	if (fc->connected != 2)
+		goto out_unlock;
+
+	if (f->private_data)
+		goto out_unlock;
+
+	f->private_data = fuse_conn_get(fc);
+	fc->connected = 1;
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&fuse_mutex);
+out_fput:
+	fput(f);
+out:
+	return err;
+}
 
 static int fuse_dev_fasync(int fd, struct file *file, int on)
 {

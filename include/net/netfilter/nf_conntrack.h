@@ -36,6 +36,13 @@ union nf_conntrack_proto {
 	struct nf_ct_gre gre;
 };
 
+/* RHEL only: per conntrack: protocol private data extra space (ABI) */
+struct nf_conntrack_proto_ext {
+	/* For SYN packets while we may be out-of-sync */
+	u_int8_t	last_wscale;	/* Last window scaling factor seen */
+	u_int8_t	last_flags;	/* Last flags set */
+};
+
 union nf_conntrack_expect_proto {
 	/* insert expect proto private data here */
 };
@@ -123,6 +130,11 @@ struct nf_conn {
 	struct nf_ct_ext *ext;
 #ifdef CONFIG_NET_NS
 	struct net *ct_net;
+#endif
+
+#ifndef __GENKSYMS__
+	/* Extra storage reserved for other modules: */
+	struct nf_conntrack_proto_ext proto_ext;
 #endif
 };
 
@@ -270,6 +282,7 @@ extern struct nf_conn *
 nf_conntrack_alloc(struct net *net,
 		   const struct nf_conntrack_tuple *orig,
 		   const struct nf_conntrack_tuple *repl,
+		   struct user_beancounter *,
 		   gfp_t gfp);
 
 /* It's confirmed if it is, or has been in the hash table. */
@@ -290,7 +303,7 @@ static inline int nf_ct_is_untracked(const struct sk_buff *skb)
 
 extern int nf_conntrack_set_hashsize(const char *val, struct kernel_param *kp);
 extern unsigned int nf_conntrack_htable_size;
-extern unsigned int nf_conntrack_max;
+extern int ip_conntrack_disable_ve0 /* XXX: unused */;
 
 #define NF_CT_STAT_INC(net, count)	\
 	(per_cpu_ptr((net)->ct.stat, raw_smp_processor_id())->count++)

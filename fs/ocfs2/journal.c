@@ -362,11 +362,14 @@ handle_t *ocfs2_start_trans(struct ocfs2_super *osb, int max_buffs)
 	if (journal_current_handle())
 		return jbd2_journal_start(journal, max_buffs);
 
+	sb_start_intwrite(osb->sb);
+
 	down_read(&osb->journal->j_trans_barrier);
 
 	handle = jbd2_journal_start(journal, max_buffs);
 	if (IS_ERR(handle)) {
 		up_read(&osb->journal->j_trans_barrier);
+		sb_end_intwrite(osb->sb);
 
 		mlog_errno(PTR_ERR(handle));
 
@@ -395,8 +398,10 @@ int ocfs2_commit_trans(struct ocfs2_super *osb,
 	if (ret < 0)
 		mlog_errno(ret);
 
-	if (!nested)
+	if (!nested) {
 		up_read(&journal->j_trans_barrier);
+		sb_end_intwrite(osb->sb);
+	}
 
 	return ret;
 }
@@ -469,7 +474,7 @@ static inline struct ocfs2_triggers *to_ocfs2_trigger(struct jbd2_buffer_trigger
 	return container_of(triggers, struct ocfs2_triggers, ot_triggers);
 }
 
-static void ocfs2_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
+static void ocfs2_frozen_trigger(struct jbd2_buffer_trigger_type *triggers,
 				 struct buffer_head *bh,
 				 void *data, size_t size)
 {
@@ -488,7 +493,7 @@ static void ocfs2_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
  * Quota blocks have their own trigger because the struct ocfs2_block_check
  * offset depends on the blocksize.
  */
-static void ocfs2_dq_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
+static void ocfs2_dq_frozen_trigger(struct jbd2_buffer_trigger_type *triggers,
 				 struct buffer_head *bh,
 				 void *data, size_t size)
 {
@@ -508,7 +513,7 @@ static void ocfs2_dq_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
  * Directory blocks also have their own trigger because the
  * struct ocfs2_block_check offset depends on the blocksize.
  */
-static void ocfs2_db_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
+static void ocfs2_db_frozen_trigger(struct jbd2_buffer_trigger_type *triggers,
 				 struct buffer_head *bh,
 				 void *data, size_t size)
 {
@@ -541,7 +546,7 @@ static void ocfs2_abort_trigger(struct jbd2_buffer_trigger_type *triggers,
 
 static struct ocfs2_triggers di_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_commit_trigger,
+		.t_frozen = ocfs2_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 	.ot_offset	= offsetof(struct ocfs2_dinode, i_check),
@@ -549,7 +554,7 @@ static struct ocfs2_triggers di_triggers = {
 
 static struct ocfs2_triggers eb_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_commit_trigger,
+		.t_frozen = ocfs2_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 	.ot_offset	= offsetof(struct ocfs2_extent_block, h_check),
@@ -557,7 +562,7 @@ static struct ocfs2_triggers eb_triggers = {
 
 static struct ocfs2_triggers rb_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_commit_trigger,
+		.t_frozen = ocfs2_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 	.ot_offset	= offsetof(struct ocfs2_refcount_block, rf_check),
@@ -565,7 +570,7 @@ static struct ocfs2_triggers rb_triggers = {
 
 static struct ocfs2_triggers gd_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_commit_trigger,
+		.t_frozen = ocfs2_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 	.ot_offset	= offsetof(struct ocfs2_group_desc, bg_check),
@@ -573,14 +578,14 @@ static struct ocfs2_triggers gd_triggers = {
 
 static struct ocfs2_triggers db_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_db_commit_trigger,
+		.t_frozen = ocfs2_db_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 };
 
 static struct ocfs2_triggers xb_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_commit_trigger,
+		.t_frozen = ocfs2_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 	.ot_offset	= offsetof(struct ocfs2_xattr_block, xb_check),
@@ -588,14 +593,14 @@ static struct ocfs2_triggers xb_triggers = {
 
 static struct ocfs2_triggers dq_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_dq_commit_trigger,
+		.t_frozen = ocfs2_dq_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 };
 
 static struct ocfs2_triggers dr_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_commit_trigger,
+		.t_frozen = ocfs2_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 	.ot_offset	= offsetof(struct ocfs2_dx_root_block, dr_check),
@@ -603,7 +608,7 @@ static struct ocfs2_triggers dr_triggers = {
 
 static struct ocfs2_triggers dl_triggers = {
 	.ot_triggers = {
-		.t_commit = ocfs2_commit_trigger,
+		.t_frozen = ocfs2_frozen_trigger,
 		.t_abort = ocfs2_abort_trigger,
 	},
 	.ot_offset	= offsetof(struct ocfs2_dx_leaf, dl_check),

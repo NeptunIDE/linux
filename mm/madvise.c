@@ -9,9 +9,12 @@
 #include <linux/pagemap.h>
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
+#include <linux/page-isolation.h>
 #include <linux/hugetlb.h>
 #include <linux/sched.h>
 #include <linux/ksm.h>
+#include <linux/swap.h>
+#include <linux/file.h>
 
 /*
  * Any behaviour which results in changes to the vma->vm_flags needs to
@@ -24,6 +27,7 @@ static int madvise_need_mmap_write(int behavior)
 	case MADV_REMOVE:
 	case MADV_WILLNEED:
 	case MADV_DONTNEED:
+	case MADV_DEACTIVATE:
 		return 0;
 	default:
 		/* be safe, default to 1. list exceptions explicitly */
@@ -67,6 +71,12 @@ static long madvise_behavior(struct vm_area_struct * vma,
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
 		error = ksm_madvise(vma, start, end, behavior, &new_flags);
+		if (error)
+			goto out;
+		break;
+	case MADV_HUGEPAGE:
+	case MADV_NOHUGEPAGE:
+		error = hugepage_madvise(vma, &new_flags, behavior);
 		if (error)
 			goto out;
 		break;
@@ -190,30 +200,38 @@ static long madvise_remove(struct vm_area_struct *vma,
 	struct address_space *mapping;
 	loff_t offset, endoff;
 	int error;
+	struct file *f;
 
 	*prev = NULL;	/* tell sys_madvise we drop mmap_sem */
 
 	if (vma->vm_flags & (VM_LOCKED|VM_NONLINEAR|VM_HUGETLB))
 		return -EINVAL;
 
-	if (!vma->vm_file || !vma->vm_file->f_mapping
-		|| !vma->vm_file->f_mapping->host) {
+	f = vma->vm_file;
+
+	if (!f || !f->f_mapping || !f->f_mapping->host) {
 			return -EINVAL;
 	}
 
 	if ((vma->vm_flags & (VM_SHARED|VM_WRITE)) != (VM_SHARED|VM_WRITE))
 		return -EACCES;
 
-	mapping = vma->vm_file->f_mapping;
+	mapping = f->f_mapping;
 
 	offset = (loff_t)(start - vma->vm_start)
 			+ ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
 	endoff = (loff_t)(end - vma->vm_start - 1)
 			+ ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
 
-	/* vmtruncate_range needs to take i_mutex and i_alloc_sem */
+	/* vmtruncate_range needs to take i_mutex and i_alloc_sem.
+	 * We need to explicitly grab a reference because the vma (and
+	 * hence the vma's reference to the file) can go away as soon
+	 * as we drop mmap_sem.
+	 */
+	get_file(f);
 	up_read(&current->mm->mmap_sem);
 	error = vmtruncate_range(mapping->host, offset, endoff);
+	fput(f);
 	down_read(&current->mm->mmap_sem);
 	return error;
 }
@@ -222,7 +240,7 @@ static long madvise_remove(struct vm_area_struct *vma,
 /*
  * Error injection support for memory error handling.
  */
-static int madvise_hwpoison(unsigned long start, unsigned long end)
+static int madvise_hwpoison(int bhv, unsigned long start, unsigned long end)
 {
 	int ret = 0;
 
@@ -230,19 +248,45 @@ static int madvise_hwpoison(unsigned long start, unsigned long end)
 		return -EPERM;
 	for (; start < end; start += PAGE_SIZE) {
 		struct page *p;
-		int ret = get_user_pages(current, current->mm, start, 1,
-						0, 0, &p, NULL);
+		int ret = get_user_pages_fast(start, 1, 0, &p);
 		if (ret != 1)
 			return ret;
+		if (bhv == MADV_SOFT_OFFLINE) {
+			printk(KERN_INFO "Soft offlining page %lx at %lx\n",
+				page_to_pfn(p), start);
+			ret = soft_offline_page(p, MF_COUNT_INCREASED);
+			if (ret)
+				break;
+			continue;
+		}
 		printk(KERN_INFO "Injecting memory failure for page %lx at %lx\n",
 		       page_to_pfn(p), start);
 		/* Ignore return value for now */
-		__memory_failure(page_to_pfn(p), 0, 1);
-		put_page(p);
+		__memory_failure(page_to_pfn(p), 0, MF_COUNT_INCREASED);
 	}
 	return ret;
 }
 #endif
+
+static long madvise_deactivate(struct vm_area_struct * vma,
+			       struct vm_area_struct ** prev,
+			       unsigned long start, unsigned long end)
+{
+	unsigned long addr;
+	struct page *page;
+
+	*prev = vma;
+	for (addr = start ; addr < end ; addr++) {
+		page = follow_page(vma, addr, FOLL_GET);
+		if (!page)
+			continue;
+		if (IS_ERR(page))
+			return PTR_ERR(page);
+		deactivate_page(page);
+		put_page(page);
+	}
+	return 0;
+}
 
 static long
 madvise_vma(struct vm_area_struct *vma, struct vm_area_struct **prev,
@@ -255,6 +299,8 @@ madvise_vma(struct vm_area_struct *vma, struct vm_area_struct **prev,
 		return madvise_willneed(vma, prev, start, end);
 	case MADV_DONTNEED:
 		return madvise_dontneed(vma, prev, start, end);
+	case MADV_DEACTIVATE:
+		return madvise_deactivate(vma, prev, start, end);
 	default:
 		return madvise_behavior(vma, prev, start, end, behavior);
 	}
@@ -272,9 +318,14 @@ madvise_behavior_valid(int behavior)
 	case MADV_REMOVE:
 	case MADV_WILLNEED:
 	case MADV_DONTNEED:
+	case MADV_DEACTIVATE:
 #ifdef CONFIG_KSM
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
+#endif
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	case MADV_HUGEPAGE:
+	case MADV_NOHUGEPAGE:
 #endif
 		return 1;
 
@@ -335,8 +386,8 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 	size_t len;
 
 #ifdef CONFIG_MEMORY_FAILURE
-	if (behavior == MADV_HWPOISON)
-		return madvise_hwpoison(start, start+len_in);
+	if (behavior == MADV_HWPOISON || behavior == MADV_SOFT_OFFLINE)
+		return madvise_hwpoison(behavior, start, start+len_in);
 #endif
 	if (!madvise_behavior_valid(behavior))
 		return error;

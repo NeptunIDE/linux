@@ -162,6 +162,7 @@ static int ocfs2_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 	sigset_t blocked, oldset;
 	int ret, ret2;
 
+	sb_start_pagefault(inode->i_sb);
 	ret = ocfs2_vm_op_block_sigs(&blocked, &oldset);
 	if (ret < 0) {
 		mlog_errno(ret);
@@ -195,10 +196,12 @@ static int ocfs2_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 
 out:
 	ret2 = ocfs2_vm_op_unblock_sigs(&oldset);
+	sb_end_pagefault(inode->i_sb);
 	if (ret2 < 0)
 		mlog_errno(ret2);
 	if (ret)
 		ret = VM_FAULT_SIGBUS;
+
 	return ret;
 }
 
