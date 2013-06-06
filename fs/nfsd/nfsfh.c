@@ -1,6 +1,4 @@
 /*
- * linux/fs/nfsd/nfsfh.c
- *
  * NFS server file handle treatment.
  *
  * Copyright (C) 1995, 1996 Olaf Kirch <okir@monad.swb.de>
@@ -9,19 +7,11 @@
  * ... and again Southern-Winter 2001 to support export_operations
  */
 
-#include <linux/slab.h>
-#include <linux/fs.h>
-#include <linux/unistd.h>
-#include <linux/string.h>
-#include <linux/stat.h>
-#include <linux/dcache.h>
 #include <linux/exportfs.h>
-#include <linux/mount.h>
 
-#include <linux/sunrpc/clnt.h>
-#include <linux/sunrpc/svc.h>
 #include <linux/sunrpc/svcauth_gss.h>
-#include <linux/nfsd/nfsd.h>
+#include "nfsd.h"
+#include "vfs.h"
 #include "auth.h"
 
 #define NFSDDBG_FACILITY		NFSDDBG_FH
@@ -96,8 +86,10 @@ nfsd_mode_check(struct svc_rqst *rqstp, umode_t mode, int type)
 static __be32 nfsd_setuser_and_check_port(struct svc_rqst *rqstp,
 					  struct svc_export *exp)
 {
+	int flags = nfsexp_flags(rqstp, exp);
+
 	/* Check if the request originated from a secure port. */
-	if (!rqstp->rq_secure && EX_SECURE(exp)) {
+	if (!rqstp->rq_secure && !(flags & NFSEXP_INSECURE_PORT)) {
 		RPC_IFDEBUG(char buf[RPC_MAX_ADDRBUFLEN]);
 		dprintk(KERN_WARNING
 		       "nfsd: request from insecure port %s!\n",
@@ -107,6 +99,36 @@ static __be32 nfsd_setuser_and_check_port(struct svc_rqst *rqstp,
 
 	/* Set user creds for this exportpoint */
 	return nfserrno(nfsd_setuser(rqstp, exp));
+}
+
+static inline __be32 check_pseudo_root(struct svc_rqst *rqstp,
+	struct dentry *dentry, struct svc_export *exp)
+{
+	if (!(exp->ex_flags & NFSEXP_V4ROOT))
+		return nfs_ok;
+	/*
+	 * v2/v3 clients have no need for the V4ROOT export--they use
+	 * the mount protocl instead; also, further V4ROOT checks may be
+	 * in v4-specific code, in which case v2/v3 clients could bypass
+	 * them.
+	 */
+	if (!nfsd_v4client(rqstp))
+		return nfserr_stale;
+	/*
+	 * We're exposing only the directories and symlinks that have to be
+	 * traversed on the way to real exports:
+	 */
+	if (unlikely(!S_ISDIR(dentry->d_inode->i_mode) &&
+		     !S_ISLNK(dentry->d_inode->i_mode)))
+		return nfserr_stale;
+	/*
+	 * A pseudoroot export gives permission to access only one
+	 * single directory; the kernel has to make another upcall
+	 * before granting access to anything else under it:
+	 */
+	if (unlikely(dentry != exp->ex_path.dentry))
+		return nfserr_stale;
+	return nfs_ok;
 }
 
 /*
@@ -123,6 +145,7 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	int fileid_type;
 	int data_left = fh->fh_size/4;
 	__be32 error;
+	int err_line = 0;
 
 	error = nfserr_stale;
 	if (rqstp->rq_vers > 2)
@@ -133,13 +156,16 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	if (fh->fh_version == 1) {
 		int len;
 
-		if (--data_left < 0)
-			return error;
-		if (fh->fh_auth_type != 0)
-			return error;
+		if (--data_left < 0) {
+			err_line = __LINE__; goto out_err;
+		}
+		if (fh->fh_auth_type != 0) {
+			err_line = __LINE__; goto out_err;
+		}
 		len = key_len(fh->fh_fsid_type) / 4;
-		if (len == 0)
-			return error;
+		if (len == 0) {
+			err_line = __LINE__; goto out_err;
+		}
 		if  (fh->fh_fsid_type == FSID_MAJOR_MINOR) {
 			/* deprecated, convert to type 3 */
 			len = key_len(FSID_ENCODE_DEV)/4;
@@ -148,8 +174,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 			fh->fh_fsid[1] = fh->fh_fsid[2];
 		}
 		data_left -= len;
-		if (data_left < 0)
-			return error;
+		if (data_left < 0) {
+			err_line = __LINE__; goto out_err;
+		}
 		exp = rqst_exp_find(rqstp, fh->fh_fsid_type, fh->fh_auth);
 		fid = (struct fid *)(fh->fh_auth + len);
 	} else {
@@ -157,8 +184,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 		dev_t xdev;
 		ino_t xino;
 
-		if (fh->fh_size != NFS_FHSIZE)
-			return error;
+		if (fh->fh_size != NFS_FHSIZE) {
+			err_line = __LINE__; goto out_err;
+		}
 		/* assume old filehandle format */
 		xdev = old_decode_dev(fh->ofh_xdev);
 		xino = u32_to_ino_t(fh->ofh_xino);
@@ -167,8 +195,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	}
 
 	error = nfserr_stale;
-	if (PTR_ERR(exp) == -ENOENT)
-		return error;
+	if (PTR_ERR(exp) == -ENOENT) {
+		err_line = __LINE__; goto out_err;
+	}
 
 	if (IS_ERR(exp))
 		return nfserrno(PTR_ERR(exp));
@@ -193,8 +222,10 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 		put_cred(new);
 	} else {
 		error = nfsd_setuser_and_check_port(rqstp, exp);
-		if (error)
+		if (error) {
+			err_line = __LINE__;
 			goto out;
+		}
 	}
 
 	/*
@@ -223,21 +254,19 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 		dentry = exportfs_decode_fh(exp->ex_path.mnt, fid,
 				data_left, fileid_type,
 				nfsd_acceptable, exp);
+		if (dentry == NULL)
+			printk(KERN_ERR "%s: exportfs_decode_fh failed\n", __func__);
 	}
-	if (dentry == NULL)
+	if (dentry == NULL) {
+		err_line = __LINE__;
 		goto out;
+	}
 	if (IS_ERR(dentry)) {
 		if (PTR_ERR(dentry) != -EINVAL)
 			error = nfserrno(PTR_ERR(dentry));
+		printk(KERN_ERR "%s: encoded dentry is err: %ld\n", __func__, PTR_ERR(dentry));
+		err_line = __LINE__;
 		goto out;
-	}
-
-	if (exp->ex_flags & NFSEXP_NOSUBTREECHECK) {
-		error = nfsd_setuser_and_check_port(rqstp, exp);
-		if (error) {
-			dput(dentry);
-			goto out;
-		}
 	}
 
 	if (S_ISDIR(dentry->d_inode->i_mode) &&
@@ -251,6 +280,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	return 0;
 out:
 	exp_put(exp);
+out_err:
+	if (error == nfserr_badhandle)
+		printk(KERN_ERR "%s: return BAD_HANDLE, line: %d\n", __func__, err_line);
 	return error;
 }
 
@@ -294,28 +326,32 @@ fh_verify(struct svc_rqst *rqstp, struct svc_fh *fhp, int type, int access)
 		error = nfsd_set_fh_dentry(rqstp, fhp);
 		if (error)
 			goto out;
-		dentry = fhp->fh_dentry;
-		exp = fhp->fh_export;
-	} else {
-		/*
-		 * just rechecking permissions
-		 * (e.g. nfsproc_create calls fh_verify, then nfsd_create
-		 * does as well)
-		 */
-		dprintk("nfsd: fh_verify - just checking\n");
-		dentry = fhp->fh_dentry;
-		exp = fhp->fh_export;
-		/*
-		 * Set user creds for this exportpoint; necessary even
-		 * in the "just checking" case because this may be a
-		 * filehandle that was created by fh_compose, and that
-		 * is about to be used in another nfsv4 compound
-		 * operation.
-		 */
-		error = nfsd_setuser_and_check_port(rqstp, exp);
-		if (error)
-			goto out;
 	}
+	dentry = fhp->fh_dentry;
+	exp = fhp->fh_export;
+	/*
+	 * We still have to do all these permission checks, even when
+	 * fh_dentry is already set:
+	 * 	- fh_verify may be called multiple times with different
+	 * 	  "access" arguments (e.g. nfsd_proc_create calls
+	 * 	  fh_verify(...,NFSD_MAY_EXEC) first, then later (in
+	 * 	  nfsd_create) calls fh_verify(...,NFSD_MAY_CREATE).
+	 *	- in the NFSv4 case, the filehandle may have been filled
+	 *	  in by fh_compose, and given a dentry, but further
+	 *	  compound operations performed with that filehandle
+	 *	  still need permissions checks.  In the worst case, a
+	 *	  mountpoint crossing may have changed the export
+	 *	  options, and we may now need to use a different uid
+	 *	  (for example, if different id-squashing options are in
+	 *	  effect on the new filesystem).
+	 */
+	error = check_pseudo_root(rqstp, dentry, exp);
+	if (error)
+		goto out;
+
+	error = nfsd_setuser_and_check_port(rqstp, exp);
+	if (error)
+		goto out;
 
 	error = nfsd_mode_check(rqstp, dentry->d_inode->i_mode, type);
 	if (error)
@@ -353,8 +389,16 @@ skip_pseudoflavor_check:
 			access, ntohl(error));
 	}
 out:
-	if (error == nfserr_stale)
+	if (error == nfserr_stale) {
+		extern int report_stale;
+
+		if (report_stale) {
+			printk("%s: return STALE in %d\n", __func__, get_exec_env()->veid);
+			dump_stack();
+		}
+
 		nfsdstats.fh_stale++;
+	}
 	return error;
 }
 
@@ -411,7 +455,7 @@ static bool fsid_type_ok_for_exp(u8 fsid_type, struct svc_export *exp)
 {
 	switch (fsid_type) {
 	case FSID_DEV:
-		if (!old_valid_dev(exp_sb(exp)->s_dev))
+		if (!old_valid_dev(exp_get_dev(exp)))
 			return 0;
 		/* FALL THROUGH */
 	case FSID_MAJOR_MINOR:
@@ -476,7 +520,7 @@ retry:
 			else
 				fsid_type = FSID_UUID4_INUM;
 		}
-	} else if (!old_valid_dev(exp_sb(exp)->s_dev))
+	} else if (!old_valid_dev(exp_get_dev(exp)))
 		/* for newer device numbers, we must use a newer fsid format */
 		fsid_type = FSID_ENCODE_DEV;
 	else
@@ -501,7 +545,9 @@ fh_compose(struct svc_fh *fhp, struct svc_export *exp, struct dentry *dentry,
 	struct inode * inode = dentry->d_inode;
 	struct dentry *parent = dentry->d_parent;
 	__u32 *datap;
-	dev_t ex_dev = exp_sb(exp)->s_dev;
+	dev_t ex_dev;
+
+	ex_dev = exp_get_dev(exp);
 
 	dprintk("nfsd: fh_compose(exp %02x:%02x/%ld %s/%s, ino=%ld)\n",
 		MAJOR(ex_dev), MINOR(ex_dev),
@@ -620,8 +666,9 @@ fh_put(struct svc_fh *fhp)
 		fhp->fh_post_saved = 0;
 #endif
 	}
+	fh_drop_write(fhp);
 	if (exp) {
-		cache_put(&exp->h, &svc_export_cache);
+		exp_put(exp);
 		fhp->fh_export = NULL;
 	}
 	return;

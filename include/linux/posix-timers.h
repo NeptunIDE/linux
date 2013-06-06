@@ -63,6 +63,7 @@ struct k_itimer {
 			unsigned long incr;
 			unsigned long expires;
 		} mmtimer;
+		struct rcu_head rcu;
 	} it;
 };
 
@@ -117,6 +118,12 @@ void set_process_cpu_timer(struct task_struct *task, unsigned int clock_idx,
 
 long clock_nanosleep_restart(struct restart_block *restart_block);
 
-void update_rlimit_cpu(unsigned long rlim_new);
+void update_rlimit_cpu(struct task_struct *task, unsigned long rlim_new);
 
+int timer_create_id(const clockid_t which_clock,
+		    struct sigevent *timer_event_spec, timer_t *timer_id);
+int timer_setup(timer_t timer_id, struct itimerspec *setting,
+		int overrun, int overrun_last, int signal_pending);
+void get_timer_setting(struct k_itimer *timr, struct itimerspec *setting,
+		       int *overrun, int *overrun_last, int *signal_pending);
 #endif

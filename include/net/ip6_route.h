@@ -26,6 +26,7 @@ struct route_info {
 
 #include <net/flow.h>
 #include <net/ip6_fib.h>
+#include <net/if_inet6.h>
 #include <net/sock.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
@@ -39,6 +40,7 @@ struct route_info {
 
 
 extern void			ip6_route_input(struct sk_buff *skb);
+extern void			__ip6_route_input(struct sk_buff *skb, struct in6_addr *daddr);
 
 extern struct dst_entry *	ip6_route_output(struct net *net,
 						 struct sock *sk,
@@ -54,6 +56,13 @@ extern int			ipv6_route_ioctl(struct net *net,
 extern int			ip6_route_add(struct fib6_config *cfg);
 extern int			ip6_ins_rt(struct rt6_info *);
 extern int			ip6_del_rt(struct rt6_info *);
+
+extern int                     ip6_route_get_saddr(struct net *net,
+						   struct rt6_info *rt,
+						   struct in6_addr *daddr,
+						   unsigned int prefs,
+						   struct in6_addr *saddr);
+
 
 extern struct rt6_info		*rt6_lookup(struct net *net,
 					    const struct in6_addr *daddr,
@@ -113,7 +122,7 @@ struct rt6_rtnl_dump_arg
 extern int rt6_dump_route(struct rt6_info *rt, void *p_arg);
 extern void rt6_ifdown(struct net *net, struct net_device *dev);
 extern void rt6_mtu_change(struct net_device *dev, unsigned mtu);
-
+extern void rt6_remove_prefsrc(struct inet6_ifaddr *ifp);
 
 /*
  *	Store a destination cache entry in a socket
@@ -145,6 +154,16 @@ static inline int ipv6_unicast_destination(struct sk_buff *skb)
 	struct rt6_info *rt = (struct rt6_info *) skb_dst(skb);
 
 	return rt->rt6i_flags & RTF_LOCAL;
+}
+
+int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *));
+
+static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+{
+	struct ipv6_pinfo *np = skb->sk ? inet6_sk(skb->sk) : NULL;
+
+	return (np && np->pmtudisc == IPV6_PMTUDISC_PROBE) ?
+	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
 }
 
 #endif

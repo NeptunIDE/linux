@@ -4,8 +4,9 @@
 
 #include <linux/module.h>
 #include <linux/lockd/bind.h>
+#include <linux/sched.h>
+#include <linux/ve_nfs.h>
 
-static LIST_HEAD(grace_list);
 static DEFINE_SPINLOCK(grace_lock);
 
 /**

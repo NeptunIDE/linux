@@ -248,6 +248,7 @@ enum fuse_opcode {
 	FUSE_DESTROY       = 38,
 	FUSE_IOCTL         = 39,
 	FUSE_POLL          = 40,
+	FUSE_FALLOCATE     = 43,
 
 	/* CUSE specific operations */
 	CUSE_INIT          = 4096,
@@ -257,6 +258,7 @@ enum fuse_notify_code {
 	FUSE_NOTIFY_POLL   = 1,
 	FUSE_NOTIFY_INVAL_INODE = 2,
 	FUSE_NOTIFY_INVAL_ENTRY = 3,
+	FUSE_NOTIFY_INVAL_FILES = 4,
 	FUSE_NOTIFY_CODE_MAX,
 };
 
@@ -523,6 +525,14 @@ struct fuse_notify_poll_wakeup_out {
 	__u64	kh;
 };
 
+struct fuse_fallocate_in {
+	__u64	fh;
+	__u64	offset;
+	__u64	length;
+	__u32	mode;
+	__u32	padding;
+};
+
 struct fuse_in_header {
 	__u32	len;
 	__u32	opcode;
@@ -563,6 +573,10 @@ struct fuse_notify_inval_entry_out {
 	__u64	parent;
 	__u32	namelen;
 	__u32	padding;
+};
+
+struct fuse_notify_inval_files_out {
+	__u64	ino;
 };
 
 #endif /* _LINUX_FUSE_H */

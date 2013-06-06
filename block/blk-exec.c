@@ -43,6 +43,9 @@ static void blk_end_sync_rq(struct request *rq, int error)
  * Description:
  *    Insert a fully prepared request at the back of the I/O scheduler queue
  *    for execution.  Don't wait for completion.
+ *
+ * Note:
+ *    This function will invoke @done directly if the queue is dead
  */
 void blk_execute_rq_nowait(struct request_queue *q, struct gendisk *bd_disk,
 			   struct request *rq, int at_head,
@@ -50,14 +53,25 @@ void blk_execute_rq_nowait(struct request_queue *q, struct gendisk *bd_disk,
 {
 	int where = at_head ? ELEVATOR_INSERT_FRONT : ELEVATOR_INSERT_BACK;
 
+	WARN_ON(irqs_disabled());
+
 	rq->rq_disk = bd_disk;
 	rq->end_io = done;
-	WARN_ON(irqs_disabled());
+
 	spin_lock_irq(q->queue_lock);
+
+	if (unlikely(blk_queue_dead(q))) {
+		rq->errors = -ENXIO;
+		if (rq->end_io)
+			rq->end_io(rq, rq->errors);
+		spin_unlock_irq(q->queue_lock);
+		return;
+	}
+
 	__elv_add_request(q, rq, where, 1);
 	__generic_unplug_device(q);
 	/* the queue is stopped so it won't be plugged+unplugged */
-	if (blk_pm_resume_request(rq))
+	if (rq->cmd_type == REQ_TYPE_PM_RESUME)
 		q->request_fn(q);
 	spin_unlock_irq(q->queue_lock);
 }
@@ -95,7 +109,7 @@ int blk_execute_rq(struct request_queue *q, struct gendisk *bd_disk,
 
 	rq->end_io_data = &wait;
 	blk_execute_rq_nowait(q, bd_disk, rq, at_head, blk_end_sync_rq);
-	wait_for_completion(&wait);
+	wait_for_completion_io(&wait);
 
 	if (rq->errors)
 		err = -EIO;

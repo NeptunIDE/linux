@@ -49,6 +49,7 @@ struct fib6_config
 	int		fc_mx_len;
 
 	struct nl_info	fc_nlinfo;
+	struct in6_addr	fc_prefsrc;
 };
 
 struct fib6_node
@@ -120,6 +121,9 @@ struct rt6_info
 #endif
 
 	struct rt6key			rt6i_src;
+#ifndef __GENKSYMS__
+	struct rt6key                   rt6i_prefsrc;
+#endif
 };
 
 static inline struct inet6_dev *ip6_dst_idev(struct dst_entry *dst)
@@ -162,6 +166,7 @@ struct fib6_table {
 	u32			tb6_id;
 	rwlock_t		tb6_lock;
 	struct fib6_node	tb6_root;
+	struct ve_struct	*owner_env;
 };
 
 #define RT6_TABLE_UNSPEC	RT_TABLE_UNSPEC

@@ -9,6 +9,7 @@
 #ifndef _LINUX_PROPORTIONS_H
 #define _LINUX_PROPORTIONS_H
 
+#include <linux/mm.h>
 #include <linux/percpu_counter.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
