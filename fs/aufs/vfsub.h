@@ -26,6 +26,7 @@
 #ifdef __KERNEL__
 
 #include <linux/fs.h>
+#include <linux/lglock.h>
 #include <linux/fs_stack.h>
 #include "debug.h"
 
@@ -193,5 +194,44 @@ int vfsub_sio_notify_change(struct path *path, struct iattr *ia);
 int vfsub_notify_change(struct path *path, struct iattr *ia);
 int vfsub_unlink(struct inode *dir, struct path *path, int force);
 
+
+/* copied from linux/fs/internal.h */
+extern void file_sb_list_del(struct file *f);
+
+/* copied from linux/fs/file_table.c */
+DECLARE_LGLOCK(files_lglock);
+#ifdef CONFIG_SMP
+/*
+ * These macros iterate all files on all CPUs for a given superblock.
+ * files_lglock must be held globally.
+ */
+#define do_file_list_for_each_entry(__sb, __file)              \
+{                                                              \
+       int i;                                                  \
+       for_each_possible_cpu(i) {                              \
+               struct list_head *list;                         \
+               list = per_cpu_ptr((__sb)->s_files, i);         \
+               list_for_each_entry((__file), list, f_u.fu_list)
+
+#define while_file_list_for_each_entry                         \
+       }                                                       \
+}
+
+#else
+
+#define do_file_list_for_each_entry(__sb, __file)              \
+{                                                              \
+       struct list_head *list;                                 \
+       list = &(sb)->s_files;                                  \
+       list_for_each_entry((__file), list, f_u.fu_list)
+
+#define while_file_list_for_each_entry                         \
+}
+#endif
+
+
+
+
 #endif /* __KERNEL__ */
 #endif /* __AUFS_VFSUB_H__ */
+
